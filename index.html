@@ -100,7 +100,7 @@ input:focus,select:focus,button:focus-visible{outline:2px solid var(--ingreso);o
 
 /* nav inferior */
 nav{position:fixed;bottom:0;left:0;right:0;background:var(--card);border-top:1px solid var(--line);display:flex;max-width:680px;margin:0 auto;z-index:10}
-nav button{flex:1;background:none;border:none;padding:10px 2px 12px;font-size:11px;color:var(--muted);cursor:pointer;font-family:inherit;position:relative}
+nav button{flex:1;background:none;border:none;padding:10px 1px 12px;font-size:10px;color:var(--muted);cursor:pointer;font-family:inherit;position:relative}
 nav button.on{color:var(--ink);font-weight:600}
 nav button .badge{position:absolute;top:5px;right:calc(50% - 22px);background:var(--gasto);color:#fff;font-size:9px;border-radius:8px;padding:0 5px;min-width:15px}
 nav button svg{display:block;margin:0 auto 2px;width:20px;height:20px;stroke:currentColor;stroke-width:1.6;fill:none;stroke-linecap:round;stroke-linejoin:round}
@@ -108,8 +108,15 @@ nav button svg{display:block;margin:0 auto 2px;width:20px;height:20px;stroke:cur
 .vacio{text-align:center;color:var(--muted);padding:36px 16px;font-size:14px}
 h2.seccion{font-family:Georgia,serif;font-weight:400;font-size:16px;margin:16px 4px 8px}
 
+/* presupuesto */
+.presu-row{display:grid;grid-template-columns:1fr auto 88px 22px;align-items:center;gap:8px;padding:6px 0;border-top:1px solid var(--line)}
+.presu-row:first-of-type{border-top:none}
+.presu-nom{font-size:13px}
+.presu-input input{width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-align:right;font-variant-numeric:tabular-nums;font-family:inherit}
+.presu-input input.ajustado{border-color:var(--plan);background:var(--plan-bg);font-weight:600;color:var(--plan)}
+.presu-x{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer;width:22px;text-align:center;padding:0}
+
 /* login */
-#login{position:fixed;inset:0;background:var(--bg);z-index:50;display:none;align-items:center;justify-content:center;padding:20px}
 #login .box{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:28px 24px;max-width:360px;width:100%}
 #login h1{font-family:Georgia,serif;font-weight:400;font-size:22px;margin:0 0 4px;display:flex;align-items:center;gap:8px}
 #login p{color:var(--muted);font-size:13px;margin:0 0 20px}
@@ -455,6 +462,52 @@ async function guardarConfig(){
 
 function flujoDe(catId){ const c=catById(catId); return c && c.tipo==='interno' ? 'interno' : 'real'; }
 
+/* ---- Presupuesto: calculado vs ajustado a mano ---- */
+// Plan efectivo de una categoría: el ajuste manual si existe, si no el calculado.
+function planEfectivo(c){
+  if (c.planManual!=null) return c.planManual;
+  if (c.planCalc!=null) return c.planCalc;
+  return c.planMes!=null ? c.planMes : 0; // compatibilidad con datos antiguos
+}
+// Recalcula planCalc de cada categoría de gasto desde los últimos 12 meses de movimientos.
+// mediana: mediana de los totales mensuales (gastos estables). anualizado: total 12m / 12 (gastos irregulares).
+function recalcularPlanes(){
+  const ms = meses();
+  if (!ms.length) return 0;
+  const ultimo = ms[ms.length-1];
+  // ventana de los 12 meses hasta el último con datos (excluye el mes en curso si está incompleto)
+  const idxUlt = ms.length-1;
+  const ventana = ms.slice(Math.max(0, idxUlt-12), idxUlt); // 12 meses cerrados anteriores al último
+  const usar = ventana.length>=6 ? ventana : ms.slice(0, idxUlt).slice(-12); // fallback si hay poco histórico
+  const base = usar.length ? usar : ms;
+  // acumula gasto neto por categoría y mes
+  const porCatMes = {};
+  for (const m of MOVS){
+    if (!base.includes(m.ym)) continue;
+    const c = catById(m.categoriaId);
+    if (!c || c.tipo!=='gasto') continue;
+    (porCatMes[c.id] = porCatMes[c.id] || {});
+    porCatMes[c.id][m.ym] = (porCatMes[c.id][m.ym]||0) + (-m.importe);
+  }
+  let n=0;
+  for (const c of CATS){
+    if (c.tipo!=='gasto') continue;
+    const serie = base.map(ym => (porCatMes[c.id] && porCatMes[c.id][ym]) || 0);
+    let val;
+    if (c.metodoBase==='anualizado'){
+      val = serie.reduce((a,b)=>a+b,0) / base.length; // media mensual (suave para irregulares)
+    } else {
+      const orden = [...serie].sort((a,b)=>a-b);
+      const mid = Math.floor(orden.length/2);
+      val = orden.length%2 ? orden[mid] : (orden[mid-1]+orden[mid])/2; // mediana
+    }
+    c.planCalc = Math.round(val);
+    n++;
+  }
+  return n;
+}
+
+
 function aplicarCategoria(mov){
   const r = categorizar(mov, REGLAS);
   if (r){ mov.categoriaId=r.cat; mov.via=r.via; mov.flujo=flujoDe(r.cat); }
@@ -528,7 +581,7 @@ const $ = s => document.querySelector(s);
 function render(){
   try{
     renderNav();
-    ({resumen:vResumen, movimientos:vMovs, bandeja:vBandeja, importar:vImportar, ajustes:vAjustes})[vista]();
+    ({resumen:vResumen, movimientos:vMovs, presupuesto:vPresupuesto, bandeja:vBandeja, importar:vImportar, ajustes:vAjustes})[vista]();
   }catch(err){
     $('#main').innerHTML = `<div class="card"><strong>Algo ha fallado al pintar esta vista.</strong>
       <div class="micro muted" style="margin-top:6px">Haz una captura de este mensaje para poder arreglarlo:</div>
@@ -540,14 +593,16 @@ function render(){
 const ICONS = {
   resumen:'<svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>',
   movimientos:'<svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>',
+  presupuesto:'<svg viewBox="0 0 24 24"><path d="M4 5h16v14H4zM4 10h16M9 15h6"/></svg>',
   bandeja:'<svg viewBox="0 0 24 24"><path d="M4 13l3 5h10l3-5M4 13V6h16v7M4 13h5l1.5 2h3L15 13h5"/></svg>',
   importar:'<svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 19h16"/></svg>',
   ajustes:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2"/></svg>'
 };
+const NAV_LABEL = {resumen:'Resumen', movimientos:'Movim.', presupuesto:'Presup.', bandeja:'Bandeja', importar:'Importar', ajustes:'Ajustes'};
 function renderNav(){
   const nb = bandeja().length;
-  $('#nav').innerHTML = ['resumen','movimientos','bandeja','importar','ajustes'].map(v=>
-    `<button class="${v===vista?'on':''}" onclick="irA('${v}')">${ICONS[v]}${v[0].toUpperCase()+v.slice(1)}${v==='bandeja'&&nb?`<span class="badge">${nb>99?'99+':nb}</span>`:''}</button>`
+  $('#nav').innerHTML = ['resumen','movimientos','presupuesto','bandeja','importar','ajustes'].map(v=>
+    `<button class="${v===vista?'on':''}" onclick="irA('${v}')">${ICONS[v]}${NAV_LABEL[v]}${v==='bandeja'&&nb?`<span class="badge">${nb>99?'99+':nb}</span>`:''}</button>`
   ).join('');
   $('#hdr-cuenta').textContent = META.cuenta ? '···'+META.cuenta.replace(/\s/g,'').slice(-4) : '';
 }
@@ -574,7 +629,7 @@ function vResumen(){
   const segs = grupos.map(([g,v])=>`<div style="width:${v/total*100}%;background:${paleta[Math.min(ci++,paleta.length-1)]}" title="${esc(g)} ${fmtEUR(v)}"></div>`).join('');
 
   const planPorGrupo={};
-  for (const c of CATS) if (c.tipo==='gasto'&&c.planMes) planPorGrupo[c.grupo]=(planPorGrupo[c.grupo]||0)+c.planMes;
+  for (const c of CATS){ if (c.tipo==='gasto'){ const p=planEfectivo(c); if(p) planPorGrupo[c.grupo]=(planPorGrupo[c.grupo]||0)+p; } }
 
   $('#main').innerHTML = `
     <div class="mespicker">
@@ -701,6 +756,73 @@ function gruposBandeja(){
     const g = grupos.get(k); g.movs.push(m); g.total += Math.abs(m.importe);
   }
   return [...grupos.values()].sort((a,b)=>b.total-a.total);
+}
+
+function vPresupuesto(){
+  // asegura que hay planCalc; si nunca se ha calculado y hay datos, calcula
+  const faltaCalc = CATS.some(c=>c.tipo==='gasto' && c.planCalc==null);
+  if (faltaCalc && MOVS.length){ recalcularPlanes(); guardarConfig(); }
+
+  const gastoCats = CATS.filter(c=>c.tipo==='gasto');
+  const grupos = [...new Set(gastoCats.map(c=>c.grupo))];
+  let totCalc=0, totEfect=0, nAjustes=0;
+  for (const c of gastoCats){ totCalc += (c.planCalc||0); totEfect += planEfectivo(c); if(c.planManual!=null) nAjustes++; }
+  const dif = totEfect - totCalc;
+
+  $('#main').innerHTML = `
+    <h2 class="seccion">Presupuesto mensual</h2>
+    <div class="kpis" style="grid-template-columns:1fr 1fr">
+      <div class="kpi"><div class="lbl">Plan calculado</div><div class="val">${fmtEUR(totCalc)}</div><div class="sub">desde tu histórico</div></div>
+      <div class="kpi"><div class="lbl">Plan vigente</div><div class="val ${dif>0?'neg':dif<0?'pos':''}">${fmtEUR(totEfect)}</div><div class="sub">${nAjustes?`${nAjustes} ajuste${nAjustes>1?'s':''} a mano · ${dif>=0?'+':''}${fmtEUR(dif)}`:'sin ajustes'}</div></div>
+    </div>
+    <p class="micro muted" style="margin:0 4px 12px">El plan calculado sale de la mediana (o media, en gastos irregulares) de tus últimos 12 meses. Puedes fijar un valor a mano si sabes que un mes o de aquí en adelante será distinto; se muestra junto al calculado para que veas la diferencia.</p>
+    ${grupos.map(g=>{
+      const cats = gastoCats.filter(c=>c.grupo===g);
+      const gCalc = cats.reduce((s,c)=>s+(c.planCalc||0),0);
+      const gEf = cats.reduce((s,c)=>s+planEfectivo(c),0);
+      return `<div class="card" style="padding:12px 14px">
+        <div class="row" style="margin-bottom:8px"><strong>${esc(g)}</strong><span class="mono">${fmtEUR(gEf)}${gEf!==gCalc?` <span class="micro muted">calc ${fmtEUR(gCalc)}</span>`:''}</span></div>
+        ${cats.map(c=>{
+          const manual = c.planManual!=null;
+          const ef = planEfectivo(c);
+          return `<div class="presu-row">
+            <span class="presu-nom">${esc(c.nombre)}</span>
+            <span class="presu-calc micro muted mono">calc ${fmtEUR(c.planCalc||0)}</span>
+            <span class="presu-input">
+              <input type="text" inputmode="decimal" id="pm-${c.id}" value="${manual?c.planManual:''}" placeholder="${c.planCalc||0}"
+                     onchange="fijarPlan('${c.id}',this.value)" class="${manual?'ajustado':''}">
+            </span>
+            ${manual?`<button class="presu-x" title="Volver al calculado" onclick="quitarPlan('${c.id}')">×</button>`:'<span class="presu-x"></span>'}
+          </div>`;
+        }).join('')}
+      </div>`;
+    }).join('')}
+    <div class="card" style="padding:12px 14px">
+      <button class="btn sec" onclick="recalcularYGuardar()">Recalcular desde el histórico</button>
+      <p class="tiny muted" style="margin:8px 0 0">Actualiza el plan calculado con los movimientos más recientes. No toca tus ajustes a mano.</p>
+    </div>`;
+}
+async function fijarPlan(catId, valor){
+  const c = catById(catId); if(!c) return;
+  const v = valor.trim().replace(/[^\d.,-]/g,'').replace(/\./g,'').replace(',','.');
+  const n = parseFloat(v);
+  if (valor.trim()==='' || isNaN(n)){ c.planManual = null; }
+  else { c.planManual = Math.round(n); }
+  c.planMes = planEfectivo(c); // mantiene compatibilidad con el resumen
+  await guardarConfig();
+  render();
+}
+async function quitarPlan(catId){
+  const c = catById(catId); if(!c) return;
+  c.planManual = null; c.planMes = planEfectivo(c);
+  await guardarConfig(); render();
+}
+async function recalcularYGuardar(){
+  const n = recalcularPlanes();
+  for (const c of CATS) c.planMes = planEfectivo(c);
+  await guardarConfig();
+  alert('Plan calculado actualizado para '+n+' categorías desde tus últimos 12 meses.');
+  render();
 }
 
 function vBandeja(){
