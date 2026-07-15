@@ -108,9 +108,16 @@ nav button svg{display:block;margin:0 auto 2px;width:20px;height:20px;stroke:cur
 .vacio{text-align:center;color:var(--muted);padding:36px 16px;font-size:14px}
 h2.seccion{font-family:Georgia,serif;font-weight:400;font-size:16px;margin:16px 4px 8px}
 
+/* barras previsión vs real */
+.pbar{position:relative;height:12px;background:var(--bg);border-radius:6px;margin-top:6px;overflow:visible;border:1px solid var(--line)}
+.pbar-fill{position:absolute;left:0;top:0;height:100%;border-radius:6px;min-width:3px}
+.pbar-prev{position:absolute;top:-3px;width:3px;height:18px;background:var(--ink);border-radius:2px;transform:translateX(-50%);box-shadow:0 0 0 1.5px var(--card)}
+.pbar-ritmo{position:absolute;top:-1px;width:2px;height:14px;background:var(--muted);transform:translateX(-50%);opacity:0.7}
+.pbar-bal .pbar-fill{left:auto}
+.pbar-cero{position:absolute;left:50%;top:-3px;width:1px;height:18px;background:var(--muted);transform:translateX(-50%);opacity:0.5}
+
 /* presupuesto */
-.presu-row{display:grid;grid-template-columns:1fr auto 88px 22px;align-items:center;gap:8px;padding:6px 0;border-top:1px solid var(--line)}
-.presu-row:first-of-type{border-top:none}
+.presu-row{display:grid;grid-template-columns:1fr auto 88px 22px;align-items:center;gap:8px;padding:6px 0;border-top:1px solid var(--line)}.presu-row:first-of-type{border-top:none}
 .presu-nom{font-size:13px}
 .presu-input input{width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-align:right;font-variant-numeric:tabular-nums;font-family:inherit}
 .presu-input input.ajustado{border-color:var(--plan);background:var(--plan-bg);font-weight:600;color:var(--plan)}
@@ -743,19 +750,41 @@ function vResumen(){
 let previsionAbierta = false;
 function togglePrevision(){ previsionAbierta = !previsionAbierta; render(); }
 
-// barra previsto vs real con marca de ritmo esperado si el mes está en curso
+// barra previsto vs real. Para ingresos/gastos (siempre >=0) barra normal;
+// para balance (puede ser negativo) barra divergente centrada en cero.
 function barraPrev(prev, real, frac, esGasto){
-  const max = Math.max(prev, real, 1);
-  const wReal = Math.min(real/max*100, 100);
-  const ritmo = frac>0 && frac<1 ? (prev*frac)/max*100 : null; // dónde debería ir hoy
-  // color: en gasto, malo si te pasas; en ingreso, bueno si superas
+  const ritmoFrac = frac>0 && frac<1 ? frac : null;
+  // color: en mes en curso se juzga contra el ritmo esperado; en mes cerrado, contra el total
   let color;
-  if (esGasto) color = real<=prev ? 'var(--ingreso)' : 'var(--gasto)';
-  else color = real>=prev*0.98 ? 'var(--ingreso)' : 'var(--plan)';
-  return `<div class="barra" style="height:8px">
-    <div class="fill" style="width:${wReal}%;background:${color}"></div>
-    <div class="marca" style="left:calc(${Math.min(prev/max*100,100)}% - 1px);background:var(--ink);height:12px;top:-2px" title="previsto"></div>
-    ${ritmo!=null?`<div class="marca" style="left:calc(${ritmo}% - 1px);background:var(--muted);height:12px;top:-2px" title="ritmo de hoy"></div>`:''}
+  if (esGasto){
+    const umbral = ritmoFrac!=null ? prev*ritmoFrac : prev;
+    color = real<=umbral*1.02 ? 'var(--ingreso)' : (real<=prev ? 'var(--plan)' : 'var(--gasto)');
+  } else {
+    const umbral = ritmoFrac!=null ? prev*ritmoFrac : prev*0.98;
+    color = real>=umbral ? 'var(--ingreso)' : 'var(--plan)';
+  }
+  const max = Math.max(prev, real, 1)*1.08;
+  const wReal = Math.max(Math.min(real/max*100,100), real>0?1.5:0);
+  const posPrev = Math.min(prev/max*100,100);
+  const ritmo = ritmoFrac!=null ? Math.min((prev*ritmoFrac)/max*100,100) : null;
+  return `<div class="pbar">
+    <div class="pbar-fill" style="width:${wReal}%;background:${color}"></div>
+    ${ritmo!=null?`<div class="pbar-ritmo" style="left:${ritmo}%" title="ritmo de hoy"></div>`:''}
+    <div class="pbar-prev" style="left:${posPrev}%" title="previsto ${fmtEUR(prev)}"></div>
+  </div>`;
+}
+
+// barra divergente para el balance (centro = 0, izquierda negativo, derecha positivo)
+function barraBalance(prev, real, frac){
+  const mag = Math.max(Math.abs(prev), Math.abs(real), 1)*1.1;
+  const pos = v => 50 + (v/mag)*50; // 0 -> 50%
+  const color = real>=prev ? 'var(--ingreso)' : 'var(--gasto)';
+  const xReal = pos(real), xPrev = pos(prev);
+  const izq = Math.min(50, xReal), anch = Math.abs(xReal-50);
+  return `<div class="pbar pbar-bal">
+    <div class="pbar-cero"></div>
+    <div class="pbar-fill" style="left:${izq}%;width:${anch}%;background:${color};border-radius:${real<0?'6px 0 0 6px':'0 6px 6px 0'}"></div>
+    <div class="pbar-prev" style="left:${xPrev}%" title="previsto ${fmtEUR(prev)}"></div>
   </div>`;
 }
 
@@ -768,16 +797,18 @@ function htmlPrevision(ym){
 
   // desvío de balance
   const desvBal = r2(p.balance.real - p.balance.prev);
-  const filaMain = (lbl, prev, real, esGasto) => {
+  const filaMain = (lbl, prev, real, tipo) => {
+    const esGasto = tipo==='gasto';
     const desv = r2(real - prev);
     const signoBueno = esGasto ? desv<=0 : desv>=0;
-    return `<div style="margin-bottom:10px">
-      <div class="row" style="align-items:baseline">
-        <span class="micro">${lbl}</span>
-        <span class="mono micro">${fmtEUR(real)} <span class="muted">/ ${fmtEUR(prev)}</span>
-          <span class="${signoBueno?'pos':'neg'}" style="margin-left:4px">${desv>=0?'+':''}${fmtEUR(desv)}</span></span>
+    const barra = tipo==='balance' ? barraBalance(prev, real, frac) : barraPrev(prev, real, frac, esGasto);
+    return `<div style="margin-bottom:14px">
+      <div class="row" style="align-items:baseline;margin-bottom:2px">
+        <span class="micro"><strong>${lbl}</strong></span>
+        <span class="mono tiny"><span style="font-size:14px">${fmtEUR(real)}</span> <span class="muted">de ${fmtEUR(prev)} prev.</span>
+          <span class="${signoBueno?'pos':'neg'}" style="margin-left:6px">${desv>=0?'+':''}${fmtEUR(desv)}</span></span>
       </div>
-      ${barraPrev(prev, real, frac, esGasto)}
+      ${barra}
     </div>`;
   };
 
@@ -793,10 +824,10 @@ function htmlPrevision(ym){
     </div>
     ${previsionAbierta?`
     <div style="margin-top:12px">
-      ${filaMain('Ingresos', p.ing.prev, p.ing.real, false)}
-      ${filaMain('Gastos', p.gasto.prev, p.gasto.real, true)}
-      ${filaMain('Balance', p.balance.prev, p.balance.real, false)}
-      <div class="tiny muted" style="margin:2px 0 10px">Barra = real · marca negra = previsto${enCurso?' · marca gris = ritmo de hoy':''}. En gastos, verde = dentro del plan; en ingresos, verde = alcanzas lo previsto.</div>
+      ${filaMain('Ingresos', p.ing.prev, p.ing.real, 'ingreso')}
+      ${filaMain('Gastos', p.gasto.prev, p.gasto.real, 'gasto')}
+      ${filaMain('Balance', p.balance.prev, p.balance.real, 'balance')}
+      <div class="tiny muted" style="margin:2px 0 12px">Relleno = real · línea negra = previsto${enCurso?' · línea gris = lo que llevarías si el gasto fuera uniforme (hoy)':''}. Verde = bien (gasto dentro del plan / ingreso alcanzado), rojo/ámbar = desviado.</div>
       ${pasadas.length?`<div class="micro muted" style="margin-bottom:4px">Categorías por encima de lo previsto:</div>
         ${pasadas.map(c=>`<div class="catrow" onclick="verCategoria('${c.id}')">
           <span>${esc(c.nombre)}</span>
