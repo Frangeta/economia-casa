@@ -54,6 +54,8 @@ main{padding:0 12px}
 .grupo .barra{height:6px;background:var(--bg);border-radius:4px;margin-top:7px;overflow:hidden;position:relative}
 .grupo .barra .fill{height:100%;border-radius:4px;background:var(--interno)}
 .grupo .barra .marca{position:absolute;top:-2px;width:2px;height:10px;background:var(--plan)}
+.barra{height:6px;background:var(--bg);border-radius:4px;overflow:hidden;position:relative}
+.barra .fill{height:100%;border-radius:4px;background:var(--interno)}
 .grupo.abierto{border-color:#CBD3CC}
 .catlist{margin-top:10px;border-top:1px solid var(--line);padding-top:6px}
 .catrow{display:flex;justify-content:space-between;padding:5px 0 5px 4px;font-size:13px;cursor:pointer;border-radius:6px}
@@ -620,12 +622,17 @@ const movsMes = ym => MOVS.filter(m=>m.ym===ym);
 function resumenMes(ym){
   const ms = movsMes(ym);
   let ingReal=0, gasReal=0, intIn=0, intOut=0;
-  const porGrupo={}, porCat={};
+  const porGrupo={}, porCat={}, porIng={};
   for (const m of ms){
     const c = catById(m.categoriaId);
     const tipo = c ? c.tipo : (m.importe>0 ? 'ingreso' : 'gasto'); // sin categoría: + = ingreso, − = gasto
     if (tipo==='interno'){ if(m.importe>0) intIn+=m.importe; else intOut+=-m.importe; continue; }
-    if (tipo==='ingreso'){ ingReal += m.importe; continue; }
+    if (tipo==='ingreso'){
+      ingReal += m.importe;
+      const iid = m.categoriaId||'__ingsc';
+      porIng[iid]=(porIng[iid]||0)+m.importe;
+      continue;
+    }
     // gasto (o sin clasificar en negativo): el importe se suma con signo, así un reembolso (+) resta del grupo
     const gastoNeto = -m.importe;
     gasReal += gastoNeto;
@@ -634,7 +641,7 @@ function resumenMes(ym){
     const cid = m.categoriaId||'__null';
     porCat[cid]=(porCat[cid]||0)+gastoNeto;
   }
-  return {ingReal:r2(ingReal), gasReal:r2(gasReal), intIn:r2(intIn), intOut:r2(intOut), porGrupo, porCat, n:ms.length};
+  return {ingReal:r2(ingReal), gasReal:r2(gasReal), intIn:r2(intIn), intOut:r2(intOut), porGrupo, porCat, porIng, n:ms.length};
 }
 const enBandeja = m => m.categoriaId===null || (m.categoriaId==='bizum_env' && !m.revisado);
 const bandeja = () => MOVS.filter(enBandeja).sort((a,b)=>b.fecha.localeCompare(a.fecha));
@@ -745,7 +752,24 @@ function vResumen(){
         ${abierto?`<div class="catlist">${cats.map(x=>`<div class="catrow" onclick="event.stopPropagation();verCategoria('${x.cid}')"><span>${esc(x.c?x.c.nombre:'Sin clasificar')}</span><span class="mono">${fmtEUR(x.cv)}</span></div>`).join('')}</div>`:''}
       </div>`;
     }).join('')}
+    ${htmlIngresos(R)}
   `;
+}
+// Desglose de ingresos del mes por origen, navegable a sus movimientos
+function htmlIngresos(R){
+  const items = Object.entries(R.porIng).map(([cid,v])=>({cid, v, c:catById(cid)}))
+    .sort((a,b)=>b.v-a.v);
+  if (!items.length) return '';
+  const max = Math.max(...items.map(x=>x.v), 1);
+  return `<h2 class="seccion">Ingresos por origen</h2>
+    <div class="card">
+      ${items.map(x=>`<div class="catrow" onclick="verCategoria('${x.cid==='__ingsc'?'__ingsc':x.cid}')">
+        <span style="flex:1">${esc(x.c?x.c.nombre:'Ingreso sin clasificar')}
+          <div class="barra" style="margin-top:5px"><div class="fill" style="width:${x.v/max*100}%;background:var(--ingreso)"></div></div>
+        </span>
+        <span class="mono pos" style="margin-left:10px">${fmtEUR(x.v)}</span>
+      </div>`).join('')}
+    </div>`;
 }
 let previsionAbierta = false;
 function togglePrevision(){ previsionAbierta = !previsionAbierta; render(); }
@@ -840,14 +864,19 @@ function htmlPrevision(ym){
 
 function cambiaMes(d){ const ms=meses(); const i=ms.indexOf(mesSel)+d; if(ms[i]){mesSel=ms[i]; grupoAbierto=null; render();} }
 function toggleGrupo(g){ grupoAbierto = grupoAbierto===g?null:g; render(); }
-function verCategoria(cid){ filtroCat = cid==='__null'?'__null':cid; vista='movimientos'; render(); window.scrollTo(0,0); }
+function verCategoria(cid){ filtroCat = cid; vista='movimientos'; render(); window.scrollTo(0,0); }
+function filtraCat(m){
+  if (filtroCat==='__null') return m.categoriaId===null && m.importe<0;
+  if (filtroCat==='__ingsc') return m.categoriaId===null && m.importe>0;
+  return m.categoriaId===filtroCat;
+}
 
 function vMovs(){
   const ms = meses();
   if (!ms.length){ $('#main').innerHTML='<div class="vacio">Sin movimientos todavía.</div>'; return; }
   if (!mesSel || !ms.includes(mesSel)) mesSel=ms[ms.length-1];
   let lista = movsMes(mesSel);
-  if (filtroCat) lista = lista.filter(m=>filtroCat==='__null'?m.categoriaId===null:m.categoriaId===filtroCat);
+  if (filtroCat) lista = lista.filter(filtraCat);
   if (filtroTxt) { const q=filtroTxt.toLowerCase(); lista = lista.filter(m=>(m.descripcion||'').toLowerCase().includes(q)); }
   lista = [...lista].sort((a,b)=>b.fecha.localeCompare(a.fecha));
   const idx = ms.indexOf(mesSel);
@@ -874,8 +903,8 @@ function htmlTotalFiltro(lista){
     if (m.importe>0) ent += m.importe; else sal += -m.importe;
   }
   const neto = r2(ent - sal);
-  const c = filtroCat && filtroCat!=='__null' ? catById(filtroCat) : null;
-  const titulo = c ? c.nombre : (filtroCat==='__null' ? 'Sin clasificar' : 'Selección');
+  const c = filtroCat && filtroCat!=='__null' && filtroCat!=='__ingsc' ? catById(filtroCat) : null;
+  const titulo = c ? c.nombre : (filtroCat==='__null' ? 'Gastos sin clasificar' : filtroCat==='__ingsc' ? 'Ingresos sin clasificar' : 'Selección');
   const etiqueta = (c && c.tipo==='gasto') ? 'Gasto neto' : (c && c.tipo==='ingreso') ? 'Total' : 'Neto';
   const valor = (c && c.tipo==='gasto') ? -neto : neto;
   return `<div class="card" style="padding:11px 14px">
@@ -904,7 +933,7 @@ function htmlListaMovs(lista){
 }
 function renderListaMovs(){
   let lista = movsMes(mesSel);
-  if (filtroCat) lista = lista.filter(m=>filtroCat==='__null'?m.categoriaId===null:m.categoriaId===filtroCat);
+  if (filtroCat) lista = lista.filter(filtraCat);
   if (filtroTxt){ const q=filtroTxt.toLowerCase(); lista=lista.filter(m=>(m.descripcion||'').toLowerCase().includes(q)); }
   lista = [...lista].sort((a,b)=>b.fecha.localeCompare(a.fecha));
   $('#listamovs').innerHTML = htmlListaMovs(lista);
@@ -1070,18 +1099,20 @@ function vBandejaLista(cabecera){
   const items = bandeja().slice(0,60);
   const total = bandeja().length;
   $('#main').innerHTML = cabecera + `
-    ${items.map(m=>`
-      <div class="bandeja-item" id="bi-${cssId(m.id)}">
-        <div class="row"><span class="micro muted">${fmtDia(m.fecha)} ${m.fecha.slice(0,4)}</span>
+    ${items.map(m=>{
+      const con = conceptoDe(m);
+      return `<div class="bandeja-item" id="bi-${cssId(m.id)}">
+        <div class="row"><span class="micro muted">${fmtDia(m.fecha)} ${m.fecha.slice(0,4)}${con.tipo==='persona'?' · <span class="pill">Bizum</span>':''}</span>
           <span class="mono ${m.importe>0?'pos':'neg'}">${fmtEUR2(m.importe)}</span></div>
-        <div style="margin:4px 0 2px">${esc(descCorta(m))}</div>
+        <div style="margin:4px 0 2px"><strong>${esc(con.clave)}</strong></div>
         <div class="tiny muted truncate">${esc(m.descripcion)}</div>
         <div class="acciones">
           <select id="sel-${cssId(m.id)}">${['<option value="">Elige categoría…</option>'].concat(agrupaOpciones(m.categoriaId)).join('')}</select>
           <button class="btn" onclick="asignarDesdeBandeja('${m.id}')">Asignar</button>
         </div>
         <div id="regla-${cssId(m.id)}"></div>
-      </div>`).join('')}
+      </div>`;
+    }).join('')}
     ${total>60?`<div class="vacio micro">Mostrando 60 de ${total}. Se irán liberando según revises.</div>`:''}`;
 }
 const cssId = id => id.replace(/[^a-zA-Z0-9]/g,'_');
@@ -1092,14 +1123,16 @@ async function asignarDesdeBandeja(id){
   if (!m || !sel.value) return;
   m.categoriaId = sel.value; m.via='manual'; m.revisado=true; m.flujo=flujoDe(sel.value);
   await dbPutAll([m]);
-  const sugerida = descCorta(m).toLowerCase().slice(0,30).trim();
+  const con = conceptoDe(m);
+  const sugerida = (con.tipo==='persona' ? con.clave : con.clave.slice(0,30)).toLowerCase().trim();
+  const valida = claveValida(sugerida, REGLAS).ok;
   const box = document.getElementById('regla-'+cssId(id));
-  box.innerHTML = `<div class="regla-box">
-    <span class="tiny muted">Regla:</span>
+  box.innerHTML = valida ? `<div class="regla-box">
+    <span class="tiny muted">Recordar "${esc(sugerida)}" como ${esc(catById(sel.value)?.nombre||'')}:</span>
     <input type="text" id="clave-${cssId(id)}" value="${esc(sugerida)}">
     <button class="btn sec" onclick="guardarRegla('${id}')">Recordar</button>
-    <button class="btn sec" onclick="renderTrasBandeja()">Omitir</button>
-  </div>`;
+    <button class="btn sec" onclick="render()">Omitir</button>
+  </div>` : `<div class="tiny muted" style="margin-top:6px">Asignado. (No se sugiere regla porque el concepto es demasiado genérico.)</div>`;
 }
 async function guardarRegla(id){
   const m = MOVS.find(x=>x.id===id);
