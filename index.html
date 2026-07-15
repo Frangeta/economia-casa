@@ -387,16 +387,36 @@ async function dbClear(){
 /* IDs de movimiento llevan '|', '#' y '/', no válidos como ID de documento Firestore: se codifican */
 function fsId(id){ return encodeURIComponent(id).replace(/\./g,'%2E'); }
 
-/* Sincroniza desde Firestore a la caché local al iniciar sesión */
-async function sincronizarDesdeNube(){
-  bannerSync('Sincronizando…');
-  const snap = await FS.collection('movimientos').get();
-  const nube = snap.docs.map(d=>d.data());
-  await cacheClear();
-  if (nube.length) await cachePut(nube);
-  MOVS = nube;
-  bannerSync('');
-  return nube.length;
+let escuchaMovs=null, escuchaConfig=null, importando=false, primerSnapshot=true;
+let renderPend=null;
+function renderDebounced(){ clearTimeout(renderPend); renderPend=setTimeout(()=>{ if(!importando) render(); }, 120); }
+
+/* Listener en vivo de movimientos: arranque desde caché + sincronización en tiempo real con la nube */
+function escucharMovimientos(){
+  if (escuchaMovs) escuchaMovs();
+  escuchaMovs = FS.collection('movimientos').onSnapshot(snap=>{
+    MOVS = snap.docs.map(d=>d.data());
+    // refresca la caché local para que el próximo arranque sin conexión esté al día
+    cacheClear().then(()=>{ if(MOVS.length) cachePut(MOVS); });
+    bannerSync(snap.metadata.fromCache ? 'Sin conexión · datos locales' : '');
+    if (!primerSnapshot || !importando) renderDebounced();
+    primerSnapshot=false;
+  }, err=>{ bannerSync('Error de sincronización'); console.error(err); });
+}
+
+/* Listener en vivo de la configuración compartida (presupuesto, reglas, metadatos) */
+function escucharConfig(){
+  if (escuchaConfig) escuchaConfig();
+  const refs = ['config/categorias','config/reglas','config/meta'];
+  const unsubs = refs.map(path => FS.doc(path).onSnapshot(doc=>{
+    if (!doc.exists || doc.metadata.hasPendingWrites) return; // ignora ecos de escrituras propias
+    const v = doc.data().v;
+    if (path.endsWith('categorias')) CATS = v;
+    else if (path.endsWith('reglas')) REGLAS = v;
+    else META = v;
+    renderDebounced();
+  }));
+  escuchaConfig = ()=>unsubs.forEach(u=>u());
 }
 function bannerSync(txt){ const b=document.getElementById('sync'); b.textContent=txt; b.style.display=txt?'block':'none'; }
 
@@ -518,6 +538,8 @@ function aplicarCategoria(mov){
 
 /* ============ IMPORTACIÓN ============ */
 async function importarFichero(file){
+  importando=true;
+  try{
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(buf,{cellDates:true});
   const sheet = wb.Sheets[wb.SheetNames[0]];
@@ -540,9 +562,10 @@ async function importarFichero(file){
   }
   if (aGuardar.length){ await dbPutAll(aGuardar); MOVS=[...porId.values()]; }
   if (parsed.cuenta && !META.cuenta){ META.cuenta=parsed.cuenta; }
-  META.ultimaImportacion=new Date().toISOString(); guardarConfig();
+  META.ultimaImportacion=new Date().toISOString(); await guardarConfig();
   const sinCat = parsed.movs.filter(m=>porId.get(m.id).categoriaId===null).length;
   return {formato:det.formato, total:parsed.movs.length, nuevos, dups, enriquecidos, sinCat};
+  } finally { importando=false; }
 }
 
 /* ============ CONSULTAS ============ */
@@ -1177,13 +1200,14 @@ AUTH.onAuthStateChanged(async user => {
     DB = await abrirDB();
     await cargarConfig();
     MOVS = await cacheGetAll();
-    if (!MOVS.length){ await sincronizarDesdeNube(); }  // primer acceso en este dispositivo
+    render();                    // arranque instantáneo desde la caché local
     if (seedActualizada && MOVS.length){
       const afectados=[];
       for (const m of MOVS){ if (m.via==='manual') continue; const antes=m.categoriaId; aplicarCategoria(m); if (m.categoriaId!==antes) afectados.push(m); }
       if (afectados.length) await dbPutAll(afectados);
     }
-    render();
+    escucharMovimientos();       // sincronización en vivo con la nube (tiempo real)
+    escucharConfig();
   } catch(e){
     document.getElementById('main').innerHTML = `<div class="card"><strong>Error al iniciar.</strong><div class="tiny mono" style="color:var(--gasto);margin-top:6px">${esc(e.message)}</div></div>`;
   }
