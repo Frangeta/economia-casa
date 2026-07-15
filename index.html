@@ -324,7 +324,8 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const AUTH = firebase.auth();
 const FS = firebase.firestore();
-FS.enablePersistence({synchronizeTabs:true}).catch(()=>{}); // caché offline
+// Caché offline (compat SDK). El aviso de deprecación en consola es inofensivo.
+FS.enablePersistence({synchronizeTabs:true}).catch(()=>{});
 let UID = null;
 
 const catById = id => CATS.find(c=>c.id===id);
@@ -398,11 +399,19 @@ function escucharMovimientos(){
     MOVS = snap.docs.map(d=>d.data());
     // refresca la caché local para que el próximo arranque sin conexión esté al día
     cacheClear().then(()=>{ if(MOVS.length) cachePut(MOVS); });
-    bannerSync(snap.metadata.fromCache ? 'Sin conexión · datos locales' : '');
+    actualizarEstadoRed();
     if (!primerSnapshot || !importando) renderDebounced();
     primerSnapshot=false;
-  }, err=>{ bannerSync('Error de sincronización'); console.error(err); });
+  }, err=>{ console.error(err); actualizarEstadoRed(); });
 }
+
+/* El estado de conexión se toma de la red real del navegador, no del origen del snapshot
+   (Firestore sirve la caché en el primer snapshot aunque haya conexión). */
+function actualizarEstadoRed(){
+  bannerSync(navigator.onLine ? '' : 'Sin conexión · usando datos locales, se sincronizará al reconectar');
+}
+window.addEventListener('online', actualizarEstadoRed);
+window.addEventListener('offline', actualizarEstadoRed);
 
 /* Listener en vivo de la configuración compartida (presupuesto, reglas, metadatos) */
 function escucharConfig(){
