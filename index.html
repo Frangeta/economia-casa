@@ -500,18 +500,19 @@ function recalcularPlanes(){
   const ventana = ms.slice(Math.max(0, idxUlt-12), idxUlt); // 12 meses cerrados anteriores al último
   const usar = ventana.length>=6 ? ventana : ms.slice(0, idxUlt).slice(-12); // fallback si hay poco histórico
   const base = usar.length ? usar : ms;
-  // acumula gasto neto por categoría y mes
+  // acumula neto por categoría y mes (gasto = suma de -importe; ingreso = suma de +importe)
   const porCatMes = {};
   for (const m of MOVS){
     if (!base.includes(m.ym)) continue;
     const c = catById(m.categoriaId);
-    if (!c || c.tipo!=='gasto') continue;
+    if (!c || (c.tipo!=='gasto' && c.tipo!=='ingreso')) continue;
     (porCatMes[c.id] = porCatMes[c.id] || {});
-    porCatMes[c.id][m.ym] = (porCatMes[c.id][m.ym]||0) + (-m.importe);
+    const signo = c.tipo==='ingreso' ? 1 : -1;
+    porCatMes[c.id][m.ym] = (porCatMes[c.id][m.ym]||0) + (signo*m.importe);
   }
   let n=0;
   for (const c of CATS){
-    if (c.tipo!=='gasto') continue;
+    if (c.tipo!=='gasto' && c.tipo!=='ingreso') continue;
     const serie = base.map(ym => (porCatMes[c.id] && porCatMes[c.id][ym]) || 0);
     let val;
     if (c.metodoBase==='anualizado'){
@@ -525,6 +526,35 @@ function recalcularPlanes(){
     n++;
   }
   return n;
+}
+
+/* Previsión del mes: previsto (plan vigente) vs real, en ingresos, gastos y balance */
+function previsionMes(ym){
+  const R = resumenMes(ym);
+  const gastoPrev = CATS.filter(c=>c.tipo==='gasto').reduce((s,c)=>s+planEfectivo(c),0);
+  const ingPrev   = CATS.filter(c=>c.tipo==='ingreso').reduce((s,c)=>s+planEfectivo(c),0);
+  // desglose por categoría de gasto: previsto vs real del mes
+  const catGasto = CATS.filter(c=>c.tipo==='gasto').map(c=>({
+    id:c.id, nombre:c.nombre, grupo:c.grupo,
+    prev: planEfectivo(c),
+    real: r2(R.porCat[c.id]||0),
+    manual: c.planManual!=null
+  })).filter(x=>x.prev>0 || x.real>0);
+  return {
+    ing:{prev:r2(ingPrev), real:R.ingReal},
+    gasto:{prev:r2(gastoPrev), real:R.gasReal},
+    balance:{prev:r2(ingPrev-gastoPrev), real:r2(R.ingReal-R.gasReal)},
+    catGasto
+  };
+}
+// progreso del mes en curso: fracción de días transcurridos (para "ritmo esperado")
+function fraccionMes(ym){
+  const hoy = new Date();
+  const [y,m] = ym.split('-').map(Number);
+  const diasMes = new Date(y, m, 0).getDate();
+  if (y<hoy.getFullYear() || (y===hoy.getFullYear() && m<hoy.getMonth()+1)) return 1; // mes pasado, completo
+  if (y>hoy.getFullYear() || (y===hoy.getFullYear() && m>hoy.getMonth()+1)) return 0; // mes futuro
+  return hoy.getDate()/diasMes; // mes en curso
 }
 
 
@@ -638,6 +668,10 @@ function vResumen(){
   const ms = meses();
   if (!ms.length){ $('#main').innerHTML = `<div class="vacio">Aún no hay movimientos.<br>Empieza importando un extracto en la pestaña Importar.</div>`; return; }
   if (!mesSel || !ms.includes(mesSel)) mesSel = ms[ms.length-1];
+  // asegura planes calculados (incluye ingresos) para poder mostrar la previsión
+  if (MOVS.length && CATS.some(c=>(c.tipo==='gasto'||c.tipo==='ingreso') && c.planCalc==null)){
+    recalcularPlanes(); guardarConfig();
+  }
   const idx = ms.indexOf(mesSel);
   const R = resumenMes(mesSel);
   const balance = r2(R.ingReal - R.gasReal);
@@ -665,6 +699,7 @@ function vResumen(){
       <div class="kpi"><div class="lbl">Gasto real</div><div class="val neg">${fmtEUR(R.gasReal)}</div></div>
       <div class="kpi"><div class="lbl">Balance</div><div class="val ${balance>=0?'pos':'neg'}">${fmtEUR(balance)}</div><div class="sub">${tasa!=null?tasa+'% de ahorro':''}</div></div>
     </div>
+    ${htmlPrevision(mesSel)}
     <div class="card">
       <div class="row"><span class="micro muted">En qué se convierte el mes</span><span class="micro muted mono">${fmtEUR(total)}</span></div>
       <div class="cinta">${segs}${wBal>0?`<div style="width:${wBal}%;background:var(--ingreso)" title="Balance ${fmtEUR(balance)}"></div>`:''}</div>
@@ -696,6 +731,73 @@ function vResumen(){
     }).join('')}
   `;
 }
+let previsionAbierta = false;
+function togglePrevision(){ previsionAbierta = !previsionAbierta; render(); }
+
+// barra previsto vs real con marca de ritmo esperado si el mes está en curso
+function barraPrev(prev, real, frac, esGasto){
+  const max = Math.max(prev, real, 1);
+  const wReal = Math.min(real/max*100, 100);
+  const ritmo = frac>0 && frac<1 ? (prev*frac)/max*100 : null; // dónde debería ir hoy
+  // color: en gasto, malo si te pasas; en ingreso, bueno si superas
+  let color;
+  if (esGasto) color = real<=prev ? 'var(--ingreso)' : 'var(--gasto)';
+  else color = real>=prev*0.98 ? 'var(--ingreso)' : 'var(--plan)';
+  return `<div class="barra" style="height:8px">
+    <div class="fill" style="width:${wReal}%;background:${color}"></div>
+    <div class="marca" style="left:calc(${Math.min(prev/max*100,100)}% - 1px);background:var(--ink);height:12px;top:-2px" title="previsto"></div>
+    ${ritmo!=null?`<div class="marca" style="left:calc(${ritmo}% - 1px);background:var(--muted);height:12px;top:-2px" title="ritmo de hoy"></div>`:''}
+  </div>`;
+}
+
+function htmlPrevision(ym){
+  const p = previsionMes(ym);
+  const frac = fraccionMes(ym);
+  const enCurso = frac>0 && frac<1;
+  const sinPrev = p.ing.prev===0 && p.gasto.prev===0;
+  if (sinPrev) return ''; // sin presupuesto configurado, no mostramos previsión
+
+  // desvío de balance
+  const desvBal = r2(p.balance.real - p.balance.prev);
+  const filaMain = (lbl, prev, real, esGasto) => {
+    const desv = r2(real - prev);
+    const signoBueno = esGasto ? desv<=0 : desv>=0;
+    return `<div style="margin-bottom:10px">
+      <div class="row" style="align-items:baseline">
+        <span class="micro">${lbl}</span>
+        <span class="mono micro">${fmtEUR(real)} <span class="muted">/ ${fmtEUR(prev)}</span>
+          <span class="${signoBueno?'pos':'neg'}" style="margin-left:4px">${desv>=0?'+':''}${fmtEUR(desv)}</span></span>
+      </div>
+      ${barraPrev(prev, real, frac, esGasto)}
+    </div>`;
+  };
+
+  // categorías más desviadas (real por encima de previsto)
+  const desviadas = p.catGasto.map(c=>({...c, desv:r2(c.real-c.prev)}))
+    .filter(c=>c.prev>0).sort((a,b)=>b.desv-a.desv);
+  const pasadas = desviadas.filter(c=>c.desv>0).slice(0,5);
+
+  return `<div class="card">
+    <div class="row" onclick="togglePrevision()" style="cursor:pointer">
+      <span><strong>Previsión del mes</strong>${enCurso?` <span class="tiny muted">día ${new Date().getDate()}, ${Math.round(frac*100)}% transcurrido</span>`:''}</span>
+      <span class="micro ${desvBal>=0?'pos':'neg'} mono">balance ${desvBal>=0?'+':''}${fmtEUR(desvBal)} vs plan ▾</span>
+    </div>
+    ${previsionAbierta?`
+    <div style="margin-top:12px">
+      ${filaMain('Ingresos', p.ing.prev, p.ing.real, false)}
+      ${filaMain('Gastos', p.gasto.prev, p.gasto.real, true)}
+      ${filaMain('Balance', p.balance.prev, p.balance.real, false)}
+      <div class="tiny muted" style="margin:2px 0 10px">Barra = real · marca negra = previsto${enCurso?' · marca gris = ritmo de hoy':''}. En gastos, verde = dentro del plan; en ingresos, verde = alcanzas lo previsto.</div>
+      ${pasadas.length?`<div class="micro muted" style="margin-bottom:4px">Categorías por encima de lo previsto:</div>
+        ${pasadas.map(c=>`<div class="catrow" onclick="verCategoria('${c.id}')">
+          <span>${esc(c.nombre)}</span>
+          <span class="mono">${fmtEUR(c.real)} <span class="muted">/ ${fmtEUR(c.prev)}</span> <span class="neg">+${fmtEUR(c.desv)}</span></span>
+        </div>`).join('')}`
+        :`<div class="micro pos">Ninguna categoría se ha pasado del plan${enCurso?' de momento':''}.</div>`}
+    </div>`:''}
+  </div>`;
+}
+
 function cambiaMes(d){ const ms=meses(); const i=ms.indexOf(mesSel)+d; if(ms[i]){mesSel=ms[i]; grupoAbierto=null; render();} }
 function toggleGrupo(g){ grupoAbierto = grupoAbierto===g?null:g; render(); }
 function verCategoria(cid){ filtroCat = cid==='__null'?'__null':cid; vista='movimientos'; render(); window.scrollTo(0,0); }
@@ -782,42 +884,54 @@ function gruposBandeja(){
 }
 
 function vPresupuesto(){
-  // asegura que hay planCalc; si nunca se ha calculado y hay datos, calcula
-  const faltaCalc = CATS.some(c=>c.tipo==='gasto' && c.planCalc==null);
+  // asegura que hay planCalc (gastos e ingresos); si nunca se ha calculado y hay datos, calcula
+  const faltaCalc = CATS.some(c=>(c.tipo==='gasto'||c.tipo==='ingreso') && c.planCalc==null);
   if (faltaCalc && MOVS.length){ recalcularPlanes(); guardarConfig(); }
 
   const gastoCats = CATS.filter(c=>c.tipo==='gasto');
+  const ingCats = CATS.filter(c=>c.tipo==='ingreso');
   const grupos = [...new Set(gastoCats.map(c=>c.grupo))];
   let totCalc=0, totEfect=0, nAjustes=0;
   for (const c of gastoCats){ totCalc += (c.planCalc||0); totEfect += planEfectivo(c); if(c.planManual!=null) nAjustes++; }
   const dif = totEfect - totCalc;
+  const ingEfect = ingCats.reduce((s,c)=>s+planEfectivo(c),0);
+  const balancePrev = ingEfect - totEfect;
+
+  const filaCat = c => {
+    const manual = c.planManual!=null;
+    return `<div class="presu-row">
+      <span class="presu-nom">${esc(c.nombre)}</span>
+      <span class="presu-calc micro muted mono">calc ${fmtEUR(c.planCalc||0)}</span>
+      <span class="presu-input">
+        <input type="text" inputmode="decimal" id="pm-${c.id}" value="${manual?c.planManual:''}" placeholder="${c.planCalc||0}"
+               onchange="fijarPlan('${c.id}',this.value)" class="${manual?'ajustado':''}">
+      </span>
+      ${manual?`<button class="presu-x" title="Volver al calculado" onclick="quitarPlan('${c.id}')">×</button>`:'<span class="presu-x"></span>'}
+    </div>`;
+  };
 
   $('#main').innerHTML = `
     <h2 class="seccion">Presupuesto mensual</h2>
-    <div class="kpis" style="grid-template-columns:1fr 1fr">
-      <div class="kpi"><div class="lbl">Plan calculado</div><div class="val">${fmtEUR(totCalc)}</div><div class="sub">desde tu histórico</div></div>
-      <div class="kpi"><div class="lbl">Plan vigente</div><div class="val ${dif>0?'neg':dif<0?'pos':''}">${fmtEUR(totEfect)}</div><div class="sub">${nAjustes?`${nAjustes} ajuste${nAjustes>1?'s':''} a mano · ${dif>=0?'+':''}${fmtEUR(dif)}`:'sin ajustes'}</div></div>
+    <div class="kpis" style="grid-template-columns:1fr 1fr 1fr">
+      <div class="kpi"><div class="lbl">Ingreso previsto</div><div class="val pos">${fmtEUR(ingEfect)}</div></div>
+      <div class="kpi"><div class="lbl">Gasto previsto</div><div class="val neg">${fmtEUR(totEfect)}</div><div class="sub">${nAjustes?`${nAjustes} ajuste${nAjustes>1?'s':''}`:'sin ajustes'}</div></div>
+      <div class="kpi"><div class="lbl">Balance previsto</div><div class="val ${balancePrev>=0?'pos':'neg'}">${fmtEUR(balancePrev)}</div></div>
     </div>
-    <p class="micro muted" style="margin:0 4px 12px">El plan calculado sale de la mediana (o media, en gastos irregulares) de tus últimos 12 meses. Puedes fijar un valor a mano si sabes que un mes o de aquí en adelante será distinto; se muestra junto al calculado para que veas la diferencia.</p>
+    <p class="micro muted" style="margin:0 4px 12px">El plan calculado sale de la mediana (o media, en categorías irregulares) de tus últimos 12 meses. Fija un valor a mano si sabes que será distinto; se muestra junto al calculado para ver la diferencia. Esto alimenta la previsión vs real del Resumen.</p>
+
+    <h2 class="seccion" style="margin-top:8px">Ingresos esperados</h2>
+    <div class="card" style="padding:12px 14px">
+      ${ingCats.map(filaCat).join('')}
+    </div>
+
+    <h2 class="seccion">Gastos</h2>
     ${grupos.map(g=>{
       const cats = gastoCats.filter(c=>c.grupo===g);
       const gCalc = cats.reduce((s,c)=>s+(c.planCalc||0),0);
       const gEf = cats.reduce((s,c)=>s+planEfectivo(c),0);
       return `<div class="card" style="padding:12px 14px">
         <div class="row" style="margin-bottom:8px"><strong>${esc(g)}</strong><span class="mono">${fmtEUR(gEf)}${gEf!==gCalc?` <span class="micro muted">calc ${fmtEUR(gCalc)}</span>`:''}</span></div>
-        ${cats.map(c=>{
-          const manual = c.planManual!=null;
-          const ef = planEfectivo(c);
-          return `<div class="presu-row">
-            <span class="presu-nom">${esc(c.nombre)}</span>
-            <span class="presu-calc micro muted mono">calc ${fmtEUR(c.planCalc||0)}</span>
-            <span class="presu-input">
-              <input type="text" inputmode="decimal" id="pm-${c.id}" value="${manual?c.planManual:''}" placeholder="${c.planCalc||0}"
-                     onchange="fijarPlan('${c.id}',this.value)" class="${manual?'ajustado':''}">
-            </span>
-            ${manual?`<button class="presu-x" title="Volver al calculado" onclick="quitarPlan('${c.id}')">×</button>`:'<span class="presu-x"></span>'}
-          </div>`;
-        }).join('')}
+        ${cats.map(filaCat).join('')}
       </div>`;
     }).join('')}
     <div class="card" style="padding:12px 14px">
