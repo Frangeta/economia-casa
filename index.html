@@ -5,6 +5,7 @@
 <title>Economía de casa</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
@@ -101,8 +102,9 @@ input:focus,select:focus,button:focus-visible{outline:2px solid var(--ingreso);o
 #hoja label{font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);display:block;margin-bottom:4px}
 
 /* nav inferior */
-nav{position:fixed;bottom:0;left:0;right:0;background:var(--card);border-top:1px solid var(--line);display:flex;max-width:680px;margin:0 auto;z-index:10}
-nav button{flex:1;background:none;border:none;padding:10px 1px 12px;font-size:10px;color:var(--muted);cursor:pointer;font-family:inherit;position:relative}
+nav{position:fixed;bottom:0;left:0;right:0;background:var(--card);border-top:1px solid var(--line);display:flex;max-width:680px;margin:0 auto;z-index:10;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+nav::-webkit-scrollbar{display:none}
+nav button{flex:1 0 auto;min-width:60px;background:none;border:none;padding:10px 6px 12px;font-size:10px;color:var(--muted);cursor:pointer;font-family:inherit;position:relative;white-space:nowrap}
 nav button.on{color:var(--ink);font-weight:600}
 nav button .badge{position:absolute;top:5px;right:calc(50% - 22px);background:var(--gasto);color:#fff;font-size:9px;border-radius:8px;padding:0 5px;min-width:15px}
 nav button svg{display:block;margin:0 auto 2px;width:20px;height:20px;stroke:currentColor;stroke-width:1.6;fill:none;stroke-linecap:round;stroke-linejoin:round}
@@ -657,7 +659,7 @@ const $ = s => document.querySelector(s);
 function render(){
   try{
     renderNav();
-    ({resumen:vResumen, movimientos:vMovs, presupuesto:vPresupuesto, bandeja:vBandeja, importar:vImportar, ajustes:vAjustes})[vista]();
+    ({resumen:vResumen, movimientos:vMovs, analisis:vAnalisis, presupuesto:vPresupuesto, bandeja:vBandeja, importar:vImportar, ajustes:vAjustes})[vista]();
   }catch(err){
     $('#main').innerHTML = `<div class="card"><strong>Algo ha fallado al pintar esta vista.</strong>
       <div class="micro muted" style="margin-top:6px">Haz una captura de este mensaje para poder arreglarlo:</div>
@@ -669,15 +671,16 @@ function render(){
 const ICONS = {
   resumen:'<svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>',
   movimientos:'<svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>',
+  analisis:'<svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>',
   presupuesto:'<svg viewBox="0 0 24 24"><path d="M4 5h16v14H4zM4 10h16M9 15h6"/></svg>',
   bandeja:'<svg viewBox="0 0 24 24"><path d="M4 13l3 5h10l3-5M4 13V6h16v7M4 13h5l1.5 2h3L15 13h5"/></svg>',
   importar:'<svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 19h16"/></svg>',
   ajustes:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2"/></svg>'
 };
-const NAV_LABEL = {resumen:'Resumen', movimientos:'Movim.', presupuesto:'Presup.', bandeja:'Bandeja', importar:'Importar', ajustes:'Ajustes'};
+const NAV_LABEL = {resumen:'Resumen', movimientos:'Movim.', analisis:'Análisis', presupuesto:'Presup.', bandeja:'Bandeja', importar:'Importar', ajustes:'Ajustes'};
 function renderNav(){
   const nb = bandeja().length;
-  $('#nav').innerHTML = ['resumen','movimientos','presupuesto','bandeja','importar','ajustes'].map(v=>
+  $('#nav').innerHTML = ['resumen','movimientos','analisis','presupuesto','bandeja','importar','ajustes'].map(v=>
     `<button class="${v===vista?'on':''}" onclick="irA('${v}')">${ICONS[v]}${NAV_LABEL[v]}${v==='bandeja'&&nb?`<span class="badge">${nb>99?'99+':nb}</span>`:''}</button>`
   ).join('');
   $('#hdr-cuenta').textContent = META.cuenta ? '···'+META.cuenta.replace(/\s/g,'').slice(-4) : '';
@@ -950,6 +953,112 @@ function gruposBandeja(){
     const g = grupos.get(k); g.movs.push(m); g.total += Math.abs(m.importe);
   }
   return [...grupos.values()].sort((a,b)=>b.total-a.total);
+}
+
+/* ============ ANÁLISIS: evolución mensual ============ */
+let anPeriodo = 12;           // meses a mostrar
+let anChart1=null, anChart2=null, anChart3=null;
+const PALETA_GRUPOS = ['#A6432D','#C0623F','#CE8155','#1E6B4F','#3E8C6E','#57687A','#B8892E','#8A7A5C','#6E7B73','#C9A26B'];
+
+function serieMeses(n){
+  const ms = meses();
+  return ms.slice(Math.max(0, ms.length-n));
+}
+function nombreMesCorto(ym){ const [y,m]=ym.split('-'); return MESES[+m-1].slice(0,3)+' '+y.slice(2); }
+
+function vAnalisis(){
+  const ms = meses();
+  if (!ms.length){ $('#main').innerHTML='<div class="vacio">Sin datos todavía. Importa un extracto primero.</div>'; return; }
+  const opciones = [6,12,24,ms.length].filter((v,i,a)=>a.indexOf(v)===i && v<=ms.length || v===ms.length);
+  $('#main').innerHTML = `
+    <h2 class="seccion">Evolución</h2>
+    <div class="filtros">
+      <select onchange="anPeriodo=+this.value;render()">
+        <option value="6" ${anPeriodo===6?'selected':''}>Últimos 6 meses</option>
+        <option value="12" ${anPeriodo===12?'selected':''}>Últimos 12 meses</option>
+        <option value="24" ${anPeriodo===24?'selected':''}>Últimos 24 meses</option>
+        <option value="999" ${anPeriodo>=999?'selected':''}>Todo el histórico</option>
+      </select>
+    </div>
+    <div class="card"><div class="micro muted" style="margin-bottom:6px">Ingresos, gastos y balance</div><div style="height:220px"><canvas id="ch-flujo"></canvas></div></div>
+    <div class="card"><div class="micro muted" style="margin-bottom:6px">Tasa de ahorro mensual</div><div style="height:170px"><canvas id="ch-ahorro"></canvas></div></div>
+    <div class="card"><div class="micro muted" style="margin-bottom:6px">Gasto por grupo</div><div style="height:240px"><canvas id="ch-grupos"></canvas></div>
+      <div id="leyenda-grupos" class="leyenda" style="margin-top:10px"></div></div>
+    <div id="an-resumen"></div>`;
+  // pintar tras insertar el DOM
+  setTimeout(pintarGraficas, 30);
+}
+
+function datosAnalisis(){
+  const serie = serieMeses(anPeriodo>=999 ? meses().length : anPeriodo);
+  const res = serie.map(ym=>({ym, r:resumenMes(ym)}));
+  // grupos de gasto presentes, ordenados por gasto total en el periodo
+  const totalGrupo = {};
+  for (const {r} of res) for (const [g,v] of Object.entries(r.porGrupo)) if(g!=='Sin clasificar') totalGrupo[g]=(totalGrupo[g]||0)+v;
+  const gruposOrd = Object.entries(totalGrupo).sort((a,b)=>b[1]-a[1]).map(([g])=>g);
+  const topGrupos = gruposOrd.slice(0,6);
+  const resto = gruposOrd.slice(6);
+  return {serie, res, topGrupos, resto};
+}
+
+function pintarGraficas(){
+  if (typeof Chart==='undefined'){ return; }
+  const {serie, res, topGrupos, resto} = datosAnalisis();
+  const labels = serie.map(nombreMesCorto);
+  const css = getComputedStyle(document.documentElement);
+  const cIng = css.getPropertyValue('--ingreso').trim(), cGas = css.getPropertyValue('--gasto').trim();
+  const cInk = css.getPropertyValue('--ink').trim(), cMuted = css.getPropertyValue('--muted').trim();
+  const gridC = 'rgba(0,0,0,0.06)';
+  const baseOpts = tituloEje => ({
+    responsive:true, maintainAspectRatio:false,
+    plugins:{legend:{display:false}, tooltip:{callbacks:{label:c=>c.dataset.label+': '+fmtEUR(c.parsed.y)}}},
+    scales:{ x:{grid:{display:false},ticks:{color:cMuted,font:{size:10}}},
+             y:{grid:{color:gridC},ticks:{color:cMuted,font:{size:10},callback:v=>v>=1000?(v/1000)+'k':v}} }
+  });
+  [anChart1,anChart2,anChart3].forEach(c=>c&&c.destroy());
+
+  // 1) ingresos / gastos / balance
+  anChart1 = new Chart(document.getElementById('ch-flujo'), {
+    type:'bar',
+    data:{labels, datasets:[
+      {label:'Ingresos', data:res.map(x=>x.r.ingReal), backgroundColor:cIng, borderRadius:3, order:2},
+      {label:'Gastos', data:res.map(x=>x.r.gasReal), backgroundColor:cGas, borderRadius:3, order:2},
+      {label:'Balance', data:res.map(x=>r2(x.r.ingReal-x.r.gasReal)), type:'line', borderColor:cInk, backgroundColor:cInk, borderWidth:2, tension:0.3, pointRadius:2, order:1}
+    ]},
+    options:{...baseOpts(), plugins:{...baseOpts().plugins, legend:{display:true, position:'bottom', labels:{boxWidth:10,font:{size:10},color:cMuted}}}}
+  });
+  // 2) tasa de ahorro
+  const tasa = res.map(x=> x.r.ingReal>0 ? Math.round((x.r.ingReal-x.r.gasReal)/x.r.ingReal*100) : 0);
+  anChart2 = new Chart(document.getElementById('ch-ahorro'), {
+    type:'line',
+    data:{labels, datasets:[{label:'Ahorro', data:tasa, borderColor:cIng, backgroundColor:'rgba(30,107,79,0.12)', fill:true, tension:0.3, pointRadius:2}]},
+    options:{...baseOpts(), plugins:{legend:{display:false}, tooltip:{callbacks:{label:c=>c.parsed.y+'% de ahorro'}}},
+      scales:{x:{grid:{display:false},ticks:{color:cMuted,font:{size:10}}}, y:{grid:{color:gridC},ticks:{color:cMuted,font:{size:10},callback:v=>v+'%'}}}}
+  });
+  // 3) gasto por grupo (barras apiladas)
+  const dsGrupos = topGrupos.map((g,i)=>({label:g, data:res.map(x=>r2(x.r.porGrupo[g]||0)), backgroundColor:PALETA_GRUPOS[i], stack:'g'}));
+  if (resto.length) dsGrupos.push({label:'Otros grupos', data:res.map(x=>r2(resto.reduce((s,g)=>s+(x.r.porGrupo[g]||0),0))), backgroundColor:PALETA_GRUPOS[9], stack:'g'});
+  anChart3 = new Chart(document.getElementById('ch-grupos'), {
+    type:'bar',
+    data:{labels, datasets:dsGrupos},
+    options:{...baseOpts(), plugins:{legend:{display:false}, tooltip:{callbacks:{label:c=>c.dataset.label+': '+fmtEUR(c.parsed.y)}}},
+      scales:{x:{stacked:true,grid:{display:false},ticks:{color:cMuted,font:{size:10}}}, y:{stacked:true,grid:{color:gridC},ticks:{color:cMuted,font:{size:10},callback:v=>v>=1000?(v/1000)+'k':v}}}}
+  });
+  // leyenda de grupos
+  const leyenda = topGrupos.map((g,i)=>`<span><span class="dot" style="background:${PALETA_GRUPOS[i]}"></span>${esc(g)}</span>`).join('')
+    + (resto.length?`<span><span class="dot" style="background:${PALETA_GRUPOS[9]}"></span>Otros grupos</span>`:'');
+  const lg = document.getElementById('leyenda-grupos'); if(lg) lg.innerHTML = leyenda;
+
+  // mini-resumen del periodo
+  const ing = res.reduce((s,x)=>s+x.r.ingReal,0), gas = res.reduce((s,x)=>s+x.r.gasReal,0);
+  const mesesN = res.length;
+  const ar = document.getElementById('an-resumen');
+  if (ar) ar.innerHTML = `<div class="card"><div class="micro muted">Medias del periodo (${mesesN} meses)</div>
+    <div class="row" style="margin-top:6px"><span>Ingreso medio/mes</span><span class="mono pos">${fmtEUR(ing/mesesN)}</span></div>
+    <div class="row"><span>Gasto medio/mes</span><span class="mono neg">${fmtEUR(gas/mesesN)}</span></div>
+    <div class="row"><span>Ahorro medio/mes</span><span class="mono ${ing-gas>=0?'pos':'neg'}">${fmtEUR((ing-gas)/mesesN)}</span></div>
+    <div class="row"><span>Tasa de ahorro media</span><span class="mono">${ing>0?Math.round((ing-gas)/ing*100):0}%</span></div>
+  </div>`;
 }
 
 function vPresupuesto(){
