@@ -744,6 +744,7 @@ function vResumen(){
       <div class="kpi"><div class="ic" style="background:var(--marca-bg)"><svg style="stroke:var(--marca)" viewBox="0 0 24 24"><path d="M3 12h18M12 3v18"/></svg></div><div class="lbl">Balance</div><div class="val" style="color:var(--marca)">${fmtEUR(balance)}</div><div class="sub">${tasa!=null?tasa+'% de ahorro':''}</div></div>
     </div>
     ${htmlPrevision(mesSel)}
+    ${htmlAvisoSubidas()}
     <div class="card">
       <div class="row"><span class="micro muted">En qué se convierte el mes</span><span class="micro muted mono">${fmtEUR(total)}</span></div>
       <div class="cinta">${segs}${wBal>0?`<div style="width:${wBal}%;background:var(--ingreso)" title="Balance ${fmtEUR(balance)}"></div>`:''}</div>
@@ -793,6 +794,18 @@ function htmlIngresos(R){
 }
 let previsionAbierta = false;
 function togglePrevision(){ previsionAbierta = !previsionAbierta; render(); }
+// aviso compacto en el Resumen si hay recibos que han subido de precio
+function htmlAvisoSubidas(){
+  const suben = recurrentesConSubida();
+  if (!suben.length) return '';
+  const extra = suben.reduce((s,r)=>s+(r.actual-r.inicial),0);
+  return `<div class="card" style="background:var(--gasto-bg);box-shadow:none;cursor:pointer" onclick="irA('analisis')">
+    <div class="row" style="align-items:center"><span class="gnom" style="gap:10px"><span style="font-size:20px">📈</span>
+      <span><strong style="color:var(--gasto)">${suben.length} recibo${suben.length>1?'s han':' ha'} subido de precio</strong>
+      <div class="tiny" style="color:var(--gasto)">unos ${fmtEUR(extra)}/mes más que al principio · ver detalle</div></span></span>
+      <span style="color:var(--gasto)">›</span></div>
+  </div>`;
+}
 
 // barra previsto vs real. Para ingresos/gastos (siempre >=0) barra normal;
 // para balance (puede ser negativo) barra divergente centrada en cero.
@@ -1001,10 +1014,39 @@ function vAnalisis(){
     <div class="card"><div class="micro muted" style="margin-bottom:6px">Tasa de ahorro mensual</div><div style="height:170px"><canvas id="ch-ahorro"></canvas></div></div>
     <div class="card"><div class="micro muted" style="margin-bottom:6px">Gasto por grupo</div><div style="height:240px"><canvas id="ch-grupos"></canvas></div>
       <div id="leyenda-grupos" class="leyenda" style="margin-top:10px"></div></div>
-    <div id="an-resumen"></div>`;
+    <div id="an-resumen"></div>
+    ${htmlRecurrentes()}`;
   // pintar tras insertar el DOM
   setTimeout(pintarGraficas, 30);
 }
+
+function htmlRecurrentes(){
+  const rec = detectarRecurrentes();
+  if (!rec.length) return '';
+  const suben = rec.filter(r=>r.subidaPct>=8);
+  const iconoR = catId => { const c=catById(catId); return c?iconoGrupo(c.grupo):'🔁'; };
+  const fila = r => {
+    const sube = r.subidaPct>=8, baja = r.subidaPct<=-8;
+    const col = sube?'var(--gasto)':baja?'var(--ingreso)':'var(--muted)';
+    const flecha = sube?'↑':baja?'↓':'→';
+    return `<div class="grupo" onclick="verRecurrente('${esc(r.claveRaw)}')">
+      <div class="row"><span class="gnom"><span class="gic">${iconoR(r.catId)}</span>${esc(r.clave)}</span>
+        <span class="mono">${fmtEUR(r.actual)}<span class="micro muted">/mes</span></span></div>
+      <div class="tiny muted" style="margin-top:4px">${r.mesesN} meses · ${catById(r.catId)?.nombre||''}
+        ${(sube||baja)?`<span style="color:${col};font-weight:600;margin-left:4px">${flecha} ${r.subidaPct>=0?'+':''}${Math.round(r.subidaPct)}% desde ${r.primerYM.slice(0,4)}</span>`:''}</div>
+    </div>`;
+  };
+  return `<h2 class="seccion">Gastos recurrentes</h2>
+    ${suben.length?`<div class="card" style="background:var(--gasto-bg);box-shadow:none">
+      <div class="row" style="align-items:flex-start"><span style="font-size:20px;margin-right:4px">📈</span>
+        <div style="flex:1"><strong style="color:var(--gasto)">${suben.length} recibo${suben.length>1?'s han':' ha'} subido de precio</strong>
+        <div class="tiny" style="color:var(--gasto);margin-top:2px">${suben.slice(0,3).map(r=>esc(r.clave)+' +'+Math.round(r.subidaPct)+'%').join(' · ')}${suben.length>3?'…':''}</div></div></div>
+    </div>`:''}
+    <p class="micro muted" style="margin:0 4px 10px">Pagos que se repiten cada mes con importe estable (suscripciones, recibos, cuotas). La flecha compara el importe actual con el de cuando empezaron.</p>
+    <div class="card">${rec.map(fila).join('')}</div>`;
+}
+function verRecurrente(clave){ filtroCat=''; filtroTxt=clave; vista='movimientos'; render(); window.scrollTo(0,0); }
+
 
 function datosAnalisis(){
   const serie = serieMeses(anPeriodo>=999 ? meses().length : anPeriodo);
@@ -1017,6 +1059,62 @@ function datosAnalisis(){
   const resto = gruposOrd.slice(6);
   return {serie, res, topGrupos, resto};
 }
+
+/* Detección de recurrentes: comercios que aparecen en muchos meses con importe estable.
+   Devuelve suscripciones/recibos fijos, marcando los que han subido de precio. */
+function limpiarNombreRec(clave){
+  let s = clave.replace(/^CORE/i,'').replace(/^PAYPAL \*/i,'').replace(/^PRES\.\d+/i,'Préstamo/Hipoteca');
+  s = s.replace(/\b(S\.?A\.?U?|S\.?L\.?U?|SOCIEDAD ANONIMA|SOCIEDAD A|CLIENTES|UNIPERSONAL)\b\.?/gi,'').trim();
+  s = s.replace(/[,.\s]+$/,'').trim();
+  // capitalizar bonito, dejando conectores en minúscula
+  const conect = new Set(['de','del','la','el','los','las','y','e']);
+  return s.split(' ').filter(Boolean).map((w,i)=>{
+    const lw = w.toLowerCase();
+    if (i>0 && conect.has(lw)) return lw;
+    return w.length>2 ? w.charAt(0)+w.slice(1).toLowerCase() : w.toUpperCase();
+  }).join(' ') || clave;
+}
+// categorías que son "recibos de verdad" cuya subida importa vigilar
+const CATS_RECIBO = new Set(['suministros','telecom','seguros','suscripciones','comunidad','hipoteca','prestamo_coche','prestamos','educacion']);
+function detectarRecurrentes(){
+  const gastos = MOVS.filter(m=>m.importe<0);
+  const grupos = {};
+  for (const m of gastos){
+    const con = conceptoDe(m);
+    if (con.tipo!=='comercio' || con.clave==='Compra con tarjeta sin comercio' || con.clave==='CUOTA TARJETA') continue;
+    // clave normalizada para agrupar variantes del mismo emisor (quita sufijos societarios)
+    const norm = con.clave.toLowerCase().replace(/^core/,'').replace(/\b(s\.?a\.?u?|s\.?l\.?u?|sociedad anonima|sociedad a|clientes|unipersonal)\b\.?/gi,'').replace(/[,.\s]+/g,' ').trim();
+    (grupos[norm] = grupos[norm] || {clave:con.clave, movs:[]}).movs.push(m);
+  }
+  const rec = [];
+  for (const k in grupos){
+    const g = grupos[k];
+    const byMes = {};
+    for (const m of g.movs){ byMes[m.ym] = (byMes[m.ym]||0) + (-m.importe); }
+    const meses = Object.keys(byMes).sort();
+    if (meses.length < 6) continue;
+    const vals = meses.map(ym=>byMes[ym]);
+    const media = vals.reduce((a,b)=>a+b,0)/vals.length;
+    const cv = Math.sqrt(vals.reduce((s,x)=>s+(x-media)**2,0)/vals.length)/media;
+    if (cv >= 0.30) continue;
+    const cats = {}; g.movs.forEach(m=>{ if(m.categoriaId) cats[m.categoriaId]=(cats[m.categoriaId]||0)+1; });
+    const catId = Object.entries(cats).sort((a,b)=>b[1]-a[1])[0]?.[0] || null;
+    const nComp = Math.min(6, Math.floor(vals.length/2));
+    const prim = vals.slice(0,nComp), ult = vals.slice(-nComp);
+    const mp = prim.reduce((a,b)=>a+b,0)/prim.length, mu = ult.reduce((a,b)=>a+b,0)/ult.length;
+    const subidaPct = mp>0 ? (mu-mp)/mp*100 : 0;
+    rec.push({
+      clave: limpiarNombreRec(g.clave), claveRaw: g.clave.toLowerCase(), catId, media, cv, mesesN: meses.length,
+      actual: mu, inicial: mp, subidaPct, primerYM: meses[0], ultimoYM: meses[meses.length-1],
+      esRecibo: CATS_RECIBO.has(catId)
+    });
+  }
+  rec.sort((a,b)=> (b.subidaPct>=8&&b.esRecibo?1:0)-(a.subidaPct>=8&&a.esRecibo?1:0) || b.media-a.media);
+  return rec;
+}
+// para el aviso destacado solo cuentan recibos de verdad que suben (no restauración puntual)
+function recurrentesConSubida(){ return detectarRecurrentes().filter(r=>r.subidaPct>=8 && r.esRecibo); }
+
 
 function pintarGraficas(){
   if (typeof Chart==='undefined'){ return; }
