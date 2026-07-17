@@ -1036,6 +1036,7 @@ function vAnalisis(){
     <div class="card"><div class="micro muted" style="margin-bottom:6px">Gasto por grupo</div><div style="height:240px"><canvas id="ch-grupos"></canvas></div>
       <div id="leyenda-grupos" class="leyenda" style="margin-top:10px"></div></div>
     <div id="an-resumen"></div>
+    ${htmlAhorroApartado()}
     ${htmlRecurrentes()}`;
   // pintar tras insertar el DOM
   setTimeout(pintarGraficas, 30);
@@ -1067,6 +1068,35 @@ function htmlRecurrentes(){
     <div class="card">${rec.map(fila).join('')}</div>`;
 }
 function verRecurrente(clave){ filtroCat=''; filtroTxt=clave; vista='movimientos'; render(); window.scrollTo(0,0); }
+
+// Panel informativo: cuánto se ha apartado a cuentas de ahorro en el periodo (no toca el balance)
+function htmlAhorroApartado(){
+  const serie = serieMeses(anPeriodo>=999 ? meses().length : anPeriodo);
+  const datos = serieAhorroApartado(serie);
+  const total = datos.reduce((s,x)=>s+x.apartado,0);
+  if (Math.abs(total)<1) return '';
+  const mesesConAporte = datos.filter(x=>x.apartado>0).length;
+  const mediaAporte = mesesConAporte ? total/mesesConAporte : 0;
+  // balance del periodo para comparar
+  const balPeriodo = serie.reduce((s,ym)=>{ const r=resumenMes(ym); return s+(r.ingReal-r.gasReal); },0);
+  const max = Math.max(...datos.map(x=>Math.abs(x.apartado)), 1);
+  return `<h2 class="seccion">Ahorro apartado 🐷</h2>
+    <div class="card">
+      <div class="row" style="margin-bottom:4px"><span class="micro muted">Movido a tus cuentas de ahorro en el periodo</span></div>
+      <div class="serif" style="font-size:26px;font-weight:600;color:var(--ingreso)">${fmtEUR(total)}</div>
+      <div class="tiny muted" style="margin-bottom:12px">unos ${fmtEUR(mediaAporte)}/mes · tu balance del periodo fue ${fmtEUR(balPeriodo)}</div>
+      ${datos.map(x=>{
+        const w = Math.abs(x.apartado)/max*100;
+        const neg = x.apartado<0;
+        return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">
+          <span class="tiny muted mono" style="width:48px">${nombreMesCorto(x.ym)}</span>
+          <div class="barra" style="flex:1"><div class="fill" style="width:${w}%;background:${neg?'var(--gasto)':'var(--ingreso)'}"></div></div>
+          <span class="tiny mono ${neg?'neg':'pos'}" style="width:64px;text-align:right">${fmtEUR(x.apartado)}</span>
+        </div>`;
+      }).join('')}
+      <div class="tiny muted" style="margin-top:10px">Esto no se resta de tu balance: es dinero tuyo que cambia de cuenta. Te muestra cuánto de tu margen has puesto a buen recaudo. Los meses en rojo sacaste de ahorro en vez de aportar.</div>
+    </div>`;
+}
 
 
 function datosAnalisis(){
@@ -1181,6 +1211,23 @@ function detectarAnomalos(mesFiltro){
   return anom;
 }
 function anomalosMes(ym){ return detectarAnomalos(ym); }
+
+/* Ahorro apartado: salidas netas a cuentas internas (ahorro + traspasos) por mes.
+   NO altera el balance (ingresos-gastos); es una vista informativa de cuánto se ha
+   movido a buen recaudo. Salida a interno = dinero apartado; entrada = dinero recuperado. */
+function ahorroApartadoMes(ym){
+  let apartado = 0;
+  for (const m of MOVS){
+    if (m.ym!==ym) continue;
+    const c = catById(m.categoriaId);
+    if (!c || c.tipo!=='interno') continue;
+    apartado += (-m.importe); // salida (importe<0) suma como apartado; entrada resta
+  }
+  return r2(apartado);
+}
+function serieAhorroApartado(serie){
+  return serie.map(ym=>({ym, apartado: ahorroApartadoMes(ym)}));
+}
 
 
 function pintarGraficas(){
