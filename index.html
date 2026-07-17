@@ -3,6 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <title>Economía de casa</title>
+<meta name="theme-color" content="#5B6EE8">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Economía">
+<meta name="mobile-web-app-capable" content="yes">
+<!-- Icono embebido (casita + €) en SVG, sin fichero aparte -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%235B6EE8'/%3E%3Cpath d='M28 46 L50 28 L72 46 V72 H28 Z' fill='none' stroke='white' stroke-width='5' stroke-linejoin='round'/%3E%3Ctext x='50' y='66' font-size='26' font-family='Georgia,serif' fill='white' text-anchor='middle' font-weight='bold'%3E%E2%82%AC%3C/text%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%235B6EE8'/%3E%3Cpath d='M28 46 L50 28 L72 46 V72 H28 Z' fill='none' stroke='white' stroke-width='5' stroke-linejoin='round'/%3E%3Ctext x='50' y='66' font-size='26' font-family='Georgia,serif' fill='white' text-anchor='middle' font-weight='bold'%3E%E2%82%AC%3C/text%3E%3C/svg%3E">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
@@ -111,7 +119,7 @@ input:focus,select:focus,button:focus-visible{outline:2px solid var(--marca);out
 #hoja label{font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);display:block;margin-bottom:4px}
 
 /* nav inferior */
-nav{position:fixed;bottom:0;left:0;right:0;background:rgba(255,255,255,.92);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-top:1px solid var(--line);display:flex;max-width:680px;margin:0 auto;z-index:10;padding:6px 2px 8px}
+nav{position:fixed;bottom:0;left:0;right:0;background:rgba(255,255,255,.92);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-top:1px solid var(--line);display:flex;max-width:680px;margin:0 auto;z-index:10;padding:6px 2px calc(8px + env(safe-area-inset-bottom))}
 nav button{flex:1;background:none;border:none;padding:4px 4px;font-size:10px;color:var(--muted);cursor:pointer;font-family:inherit;position:relative;white-space:nowrap;display:flex;flex-direction:column;align-items:center;gap:3px}
 nav button.on{color:var(--marca);font-weight:600}
 nav button .navic{width:42px;height:28px;border-radius:12px;display:flex;align-items:center;justify-content:center;transition:background .15s}
@@ -143,6 +151,11 @@ h2.seccion{font-family:'Fraunces',serif;font-weight:600;font-size:16px;margin:18
 .presu-input input{width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-align:right;font-variant-numeric:tabular-nums;font-family:inherit}
 .presu-input input.ajustado{border-color:var(--plan);background:var(--plan-bg);font-weight:600;color:var(--plan)}
 .presu-x{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer;width:22px;text-align:center;padding:0}
+
+/* slider simulador */
+input[type=range]{-webkit-appearance:none;appearance:none;height:6px;background:var(--line);border-radius:3px;outline:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:var(--marca);cursor:pointer;border:2px solid var(--card);box-shadow:var(--sombra)}
+input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:var(--marca);cursor:pointer;border:2px solid var(--card)}
 
 /* avisos unificados */
 .avisos{background:var(--card);border-radius:14px;margin-bottom:12px;box-shadow:var(--sombra);overflow:hidden}
@@ -348,7 +361,7 @@ function claveValida(k, R){
 <script>
 /* ============ ESTADO Y PERSISTENCIA ============ */
 let DB=null, MOVS=[], CATS=[], REGLAS=null, META=null;
-let vista='resumen', mesSel=null, grupoAbierto=null, filtroCat='', filtroTxt='';
+let vista='resumen', mesSel=null, grupoAbierto=null, filtroCat='', filtroTxt='', presuMes=null;
 
 /* ---- Firebase ---- */
 const firebaseConfig = {
@@ -360,6 +373,18 @@ const firebaseConfig = {
   appId: "1:301476870545:web:0d8ed9d7392ad8d8f04230"
 };
 firebase.initializeApp(firebaseConfig);
+// Manifest PWA generado en runtime (evita problemas de codificación en data-URI) para poder "instalar" la app
+(function(){
+  const icon = "data:image/svg+xml,"+encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#5B6EE8'/><path d='M28 46 L50 28 L72 46 V72 H28 Z' fill='none' stroke='white' stroke-width='5' stroke-linejoin='round'/><text x='50' y='66' font-size='26' font-family='Georgia,serif' fill='white' text-anchor='middle' font-weight='bold'>€</text></svg>`);
+  const manifest = {
+    name:'Economía de casa', short_name:'Economía', start_url:'.', display:'standalone',
+    background_color:'#F7F8FC', theme_color:'#5B6EE8',
+    icons:[{src:icon, sizes:'any', type:'image/svg+xml', purpose:'any'}]
+  };
+  const blob = new Blob([JSON.stringify(manifest)], {type:'application/manifest+json'});
+  const link = document.createElement('link'); link.rel='manifest'; link.href=URL.createObjectURL(blob);
+  document.head.appendChild(link);
+})();
 const AUTH = firebase.auth();
 const FS = firebase.firestore();
 // Caché offline (compat SDK). El aviso de deprecación en consola es inofensivo.
@@ -529,13 +554,18 @@ async function guardarConfig(){
 
 function flujoDe(catId){ const c=catById(catId); return c && c.tipo==='interno' ? 'interno' : 'real'; }
 
-/* ---- Presupuesto: calculado vs ajustado a mano ---- */
-// Plan efectivo de una categoría: el ajuste manual si existe, si no el calculado.
-function planEfectivo(c){
+/* ---- Presupuesto: calculado vs ajustado, con override opcional por mes concreto ---- */
+// Plan efectivo de una categoría. Si se pasa ym y hay un override para ese mes, manda el override.
+function planEfectivo(c, ym){
+  if (ym && META.overrides && META.overrides[ym] && META.overrides[ym][c.id]!=null){
+    return META.overrides[ym][c.id];
+  }
   if (c.planManual!=null) return c.planManual;
   if (c.planCalc!=null) return c.planCalc;
   return c.planMes!=null ? c.planMes : 0; // compatibilidad con datos antiguos
 }
+// ¿tiene override este mes/categoría?
+function tieneOverride(catId, ym){ return !!(META.overrides && META.overrides[ym] && META.overrides[ym][catId]!=null); }
 // Recalcula planCalc de cada categoría de gasto desde los últimos 12 meses de movimientos.
 // mediana: mediana de los totales mensuales (gastos estables). anualizado: total 12m / 12 (gastos irregulares).
 function recalcularPlanes(){
@@ -578,14 +608,14 @@ function recalcularPlanes(){
 /* Previsión del mes: previsto (plan vigente) vs real, en ingresos, gastos y balance */
 function previsionMes(ym){
   const R = resumenMes(ym);
-  const gastoPrev = CATS.filter(c=>c.tipo==='gasto').reduce((s,c)=>s+planEfectivo(c),0);
-  const ingPrev   = CATS.filter(c=>c.tipo==='ingreso').reduce((s,c)=>s+planEfectivo(c),0);
+  const gastoPrev = CATS.filter(c=>c.tipo==='gasto').reduce((s,c)=>s+planEfectivo(c,ym),0);
+  const ingPrev   = CATS.filter(c=>c.tipo==='ingreso').reduce((s,c)=>s+planEfectivo(c,ym),0);
   // desglose por categoría de gasto: previsto vs real del mes
   const catGasto = CATS.filter(c=>c.tipo==='gasto').map(c=>({
     id:c.id, nombre:c.nombre, grupo:c.grupo,
-    prev: planEfectivo(c),
+    prev: planEfectivo(c,ym),
     real: r2(R.porCat[c.id]||0),
-    manual: c.planManual!=null
+    manual: c.planManual!=null, override: tieneOverride(c.id,ym)
   })).filter(x=>x.prev>0 || x.real>0);
   return {
     ing:{prev:r2(ingPrev), real:R.ingReal},
@@ -686,7 +716,7 @@ const $ = s => document.querySelector(s);
 function render(){
   try{
     renderNav();
-    ({resumen:vResumen, movimientos:vMovs, analisis:vAnalisis, presupuesto:vPresupuesto, bandeja:vBandeja, importar:vImportar, ajustes:vAjustes})[vista]();
+    ({resumen:vResumen, movimientos:vMovs, analisis:vAnalisis, simulador:vSimulador, presupuesto:vPresupuesto, bandeja:vBandeja, importar:vImportar, ajustes:vAjustes})[vista]();
   }catch(err){
     $('#main').innerHTML = `<div class="card"><strong>Algo ha fallado al pintar esta vista.</strong>
       <div class="micro muted" style="margin-top:6px">Haz una captura de este mensaje para poder arreglarlo:</div>
@@ -719,7 +749,7 @@ function renderNav(){
   const nb = bandeja().length;
   // "Más" muestra punto si hay algo pendiente en bandeja
   $('#nav').innerHTML = NAV_PRINCIPAL.map(v=>{
-    const activo = v===vista || (v==='mas' && NAV_MAS.includes(vista));
+    const activo = v===vista || (v==='mas' && NAV_MAS.includes(vista)) || (v==='analisis' && vista==='simulador');
     const badge = v==='mas' && nb ? `<span class="badge">${nb>99?'99+':nb}</span>` : '';
     return `<button class="${activo?'on':''}" onclick="${v==='mas'?'abrirMas()':`irA('${v}')`}"><span class="navic">${ICONS[v]}</span>${NAV_LABEL[v]}${badge}</button>`;
   }).join('');
@@ -764,7 +794,7 @@ function vResumen(){
   const segs = grupos.map(([g,v])=>`<div style="width:${v/total*100}%;background:${paleta[Math.min(ci++,paleta.length-1)]}" title="${esc(g)} ${fmtEUR(v)}"></div>`).join('');
 
   const planPorGrupo={};
-  for (const c of CATS){ if (c.tipo==='gasto'){ const p=planEfectivo(c); if(p) planPorGrupo[c.grupo]=(planPorGrupo[c.grupo]||0)+p; } }
+  for (const c of CATS){ if (c.tipo==='gasto'){ const p=planEfectivo(c,mesSel); if(p) planPorGrupo[c.grupo]=(planPorGrupo[c.grupo]||0)+p; } }
 
   $('#main').innerHTML = `
     <div class="mespicker">
@@ -1069,10 +1099,68 @@ function vAnalisis(){
       <div id="leyenda-grupos" class="leyenda" style="margin-top:10px"></div></div>
     <div id="an-resumen"></div>
     ${htmlAhorroApartado()}
+    <div class="card" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center" onclick="irA('simulador')">
+      <span class="gnom" style="gap:10px"><span style="font-size:20px">🧮</span><strong>Simulador de ahorro</strong></span>
+      <span style="color:var(--marca)">›</span>
+    </div>
     ${htmlRecurrentes()}`;
   // pintar tras insertar el DOM
   setTimeout(pintarGraficas, 30);
 }
+
+/* Simulador: parte del gasto medio real por categoría (12m) y aplica recortes para ver
+   cuánto se ahorraría al mes y al año. Los recortes viven en simRecortes (no se guardan). */
+let simRecortes = {};   // {catId: porcentaje 0-100}
+function gastoMedioCategoria(){
+  const serie = serieMeses(12);
+  const suma = {}, cuenta = serie.length || 1;
+  for (const m of MOVS){
+    if (!serie.includes(m.ym) || m.importe>=0 || !m.categoriaId) continue;
+    const c = catById(m.categoriaId);
+    if (!c || c.tipo!=='gasto') continue;
+    suma[m.categoriaId] = (suma[m.categoriaId]||0) + (-m.importe);
+  }
+  const arr = Object.entries(suma).map(([cid,tot])=>({cid, media:tot/cuenta, c:catById(cid)}))
+    .filter(x=>x.media>=10).sort((a,b)=>b.media-a.media);
+  return arr;
+}
+function vSimulador(){
+  const cats = gastoMedioCategoria();
+  if (!cats.length){ $('#main').innerHTML='<div class="vacio">Necesito algunos meses de gastos para simular.</div>'; return; }
+  const gastoBase = cats.reduce((s,x)=>s+x.media,0);
+  const ahorroMes = cats.reduce((s,x)=>s + x.media*((simRecortes[x.cid]||0)/100), 0);
+  const nuevoGasto = gastoBase - ahorroMes;
+  const activos = Object.entries(simRecortes).filter(([,v])=>v>0);
+  $('#main').innerHTML = `
+    <h2 class="seccion">Simulador de ahorro 🧮</h2>
+    <div class="card" style="background:var(--marca-bg);box-shadow:none">
+      <div class="micro muted">Si mantienes estos recortes, ahorrarías</div>
+      <div class="serif" style="font-size:30px;font-weight:600;color:var(--marca);letter-spacing:-0.01em">${fmtEUR(ahorroMes)}<span style="font-size:16px">/mes</span></div>
+      <div class="row" style="margin-top:4px"><span class="micro muted">Al año</span><span class="mono" style="color:var(--marca);font-weight:600">${fmtEUR(ahorroMes*12)}</span></div>
+      <div class="row"><span class="micro muted">Gasto mensual: ${fmtEUR(gastoBase)} → ${fmtEUR(nuevoGasto)}</span></div>
+      ${activos.length?`<button class="btn sec" style="margin-top:10px;padding:7px 12px;font-size:13px" onclick="simReset()">Quitar recortes</button>`:''}
+    </div>
+    <p class="micro muted" style="margin:0 4px 12px">Mueve el recorte de cada categoría y mira cuánto ahorrarías. Se basa en tu gasto medio de los últimos 12 meses. Es una simulación: no cambia tus datos ni tu presupuesto.</p>
+    ${cats.map(x=>{
+      const pct = simRecortes[x.cid]||0;
+      const ahorra = x.media*(pct/100);
+      return `<div class="card" style="padding:13px 15px">
+        <div class="row" style="margin-bottom:8px"><span class="gnom"><span class="gic">${iconoGrupo(x.c?.grupo)}</span>${esc(x.c?.nombre||'?')}</span>
+          <span class="mono micro">${fmtEUR(x.media)}<span class="muted">/mes</span></span></div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <input type="range" min="0" max="100" step="5" value="${pct}" oninput="simSet('${x.cid}',this.value)" style="flex:1">
+          <span class="mono" style="width:82px;text-align:right;font-size:13px">${pct>0?`−${pct}% · ${fmtEUR(ahorra)}`:'sin recorte'}</span>
+        </div>
+      </div>`;
+    }).join('')}`;
+}
+function simSet(cid,val){
+  simRecortes[cid] = +val;
+  // actualizar solo los totales sin re-render completo (para no perder el foco del slider)
+  render();
+}
+function simReset(){ simRecortes = {}; render(); }
+
 
 function htmlRecurrentes(){
   const rec = detectarRecurrentes();
@@ -1327,16 +1415,31 @@ function vPresupuesto(){
   const faltaCalc = CATS.some(c=>(c.tipo==='gasto'||c.tipo==='ingreso') && c.planCalc==null);
   if (faltaCalc && MOVS.length){ recalcularPlanes(); guardarConfig(); }
 
+  const modoMes = presuMes;               // null = presupuesto base; 'YYYY-MM' = override de ese mes
   const gastoCats = CATS.filter(c=>c.tipo==='gasto');
   const ingCats = CATS.filter(c=>c.tipo==='ingreso');
   const grupos = [...new Set(gastoCats.map(c=>c.grupo))];
   let totCalc=0, totEfect=0, nAjustes=0;
-  for (const c of gastoCats){ totCalc += (c.planCalc||0); totEfect += planEfectivo(c); if(c.planManual!=null) nAjustes++; }
+  for (const c of gastoCats){ totCalc += (c.planCalc||0); totEfect += planEfectivo(c,modoMes); if(modoMes?tieneOverride(c.id,modoMes):c.planManual!=null) nAjustes++; }
   const dif = totEfect - totCalc;
-  const ingEfect = ingCats.reduce((s,c)=>s+planEfectivo(c),0);
+  const ingEfect = ingCats.reduce((s,c)=>s+planEfectivo(c,modoMes),0);
   const balancePrev = ingEfect - totEfect;
 
   const filaCat = c => {
+    if (modoMes){
+      // modo mes concreto: el override manda; el "base" es el valor de referencia
+      const ov = tieneOverride(c.id, modoMes);
+      const base = planEfectivo(c); // sin ym = base
+      return `<div class="presu-row">
+        <span class="presu-nom">${esc(c.nombre)}</span>
+        <span class="presu-calc micro muted mono">base ${fmtEUR(base)}</span>
+        <span class="presu-input">
+          <input type="text" inputmode="decimal" value="${ov?META.overrides[modoMes][c.id]:''}" placeholder="${base}"
+                 onchange="fijarOverride('${c.id}',this.value)" class="${ov?'ajustado':''}">
+        </span>
+        ${ov?`<button class="presu-x" title="Usar el presupuesto base" onclick="quitarOverride('${c.id}')">×</button>`:'<span class="presu-x"></span>'}
+      </div>`;
+    }
     const manual = c.planManual!=null;
     return `<div class="presu-row">
       <span class="presu-nom">${esc(c.nombre)}</span>
@@ -1349,14 +1452,32 @@ function vPresupuesto(){
     </div>`;
   };
 
+  // opciones de mes: base + meses con datos + próximos 3 meses
+  const msData = meses();
+  const proximos = [];
+  { const d=new Date(); for(let i=0;i<4;i++){ const ym=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`; proximos.push(ym); d.setMonth(d.getMonth()+1);} }
+  const opcionesMes = [...new Set([...msData, ...proximos])].sort();
+
   $('#main').innerHTML = `
-    <h2 class="seccion">Presupuesto mensual</h2>
+    <h2 class="seccion">Presupuesto</h2>
+    <div class="filtros">
+      <select onchange="presuMes=this.value||null;render()">
+        <option value="" ${!modoMes?'selected':''}>Presupuesto base (todos los meses)</option>
+        <optgroup label="Ajuste para un mes concreto">
+          ${opcionesMes.map(ym=>`<option value="${ym}" ${modoMes===ym?'selected':''}>${nombreMesLargo(ym)}${overridesDeMes(ym)?' ●':''}</option>`).join('')}
+        </optgroup>
+      </select>
+    </div>
+    ${modoMes?`<div class="card" style="background:var(--marca-bg);box-shadow:none;padding:12px 14px">
+      <div class="micro" style="color:var(--marca)"><strong>Ajustando solo ${nombreMesLargo(modoMes)}</strong></div>
+      <div class="tiny muted" style="margin-top:2px">Los valores que fijes aquí solo aplican a este mes (p. ej. vacaciones, un mes con gasto extra). El resto de meses siguen con el presupuesto base. Deja vacío para usar el base.</div>
+    </div>`:''}
     <div class="kpis" style="grid-template-columns:1fr 1fr 1fr">
       <div class="kpi"><div class="lbl">Ingreso previsto</div><div class="val pos">${fmtEUR(ingEfect)}</div></div>
-      <div class="kpi"><div class="lbl">Gasto previsto</div><div class="val neg">${fmtEUR(totEfect)}</div><div class="sub">${nAjustes?`${nAjustes} ajuste${nAjustes>1?'s':''}`:'sin ajustes'}</div></div>
+      <div class="kpi"><div class="lbl">Gasto previsto</div><div class="val neg">${fmtEUR(totEfect)}</div><div class="sub">${nAjustes?`${nAjustes} ${modoMes?'ajuste'+(nAjustes>1?'s':'')+' este mes':'ajuste'+(nAjustes>1?'s':'')}`:'sin ajustes'}</div></div>
       <div class="kpi"><div class="lbl">Balance previsto</div><div class="val ${balancePrev>=0?'pos':'neg'}">${fmtEUR(balancePrev)}</div></div>
     </div>
-    <p class="micro muted" style="margin:0 4px 12px">El plan calculado sale de la mediana (o media, en categorías irregulares) de tus últimos 12 meses. Fija un valor a mano si sabes que será distinto; se muestra junto al calculado para ver la diferencia. Esto alimenta la previsión vs real del Resumen.</p>
+    ${!modoMes?`<p class="micro muted" style="margin:0 4px 12px">El plan calculado sale de la mediana (o media, en categorías irregulares) de tus últimos 12 meses. Fija un valor a mano si sabes que será distinto. Esto alimenta la previsión vs real del Resumen.</p>`:''}
 
     <h2 class="seccion" style="margin-top:8px">Ingresos esperados</h2>
     <div class="card" style="padding:12px 14px">
@@ -1367,16 +1488,33 @@ function vPresupuesto(){
     ${grupos.map(g=>{
       const cats = gastoCats.filter(c=>c.grupo===g);
       const gCalc = cats.reduce((s,c)=>s+(c.planCalc||0),0);
-      const gEf = cats.reduce((s,c)=>s+planEfectivo(c),0);
+      const gEf = cats.reduce((s,c)=>s+planEfectivo(c,modoMes),0);
       return `<div class="card" style="padding:12px 14px">
-        <div class="row" style="margin-bottom:8px"><strong>${esc(g)}</strong><span class="mono">${fmtEUR(gEf)}${gEf!==gCalc?` <span class="micro muted">calc ${fmtEUR(gCalc)}</span>`:''}</span></div>
+        <div class="row" style="margin-bottom:8px"><strong>${esc(g)}</strong><span class="mono">${fmtEUR(gEf)}${gEf!==gCalc&&!modoMes?` <span class="micro muted">calc ${fmtEUR(gCalc)}</span>`:''}</span></div>
         ${cats.map(filaCat).join('')}
       </div>`;
     }).join('')}
-    <div class="card" style="padding:12px 14px">
+    ${!modoMes?`<div class="card" style="padding:12px 14px">
       <button class="btn sec" onclick="recalcularYGuardar()">Recalcular desde el histórico</button>
       <p class="tiny muted" style="margin:8px 0 0">Actualiza el plan calculado con los movimientos más recientes. No toca tus ajustes a mano.</p>
-    </div>`;
+    </div>`:''}`;
+}
+function nombreMesLargo(ym){ const [y,m]=ym.split('-'); return MESES[+m-1].charAt(0).toUpperCase()+MESES[+m-1].slice(1)+' '+y; }
+function overridesDeMes(ym){ return META.overrides && META.overrides[ym] ? Object.keys(META.overrides[ym]).length : 0; }
+async function fijarOverride(catId, valor){
+  const v = valor.trim().replace(/[^\d.,-]/g,'').replace(/\./g,'').replace(',','.');
+  const n = parseFloat(v);
+  META.overrides = META.overrides || {};
+  META.overrides[presuMes] = META.overrides[presuMes] || {};
+  if (valor.trim()==='' || isNaN(n)) delete META.overrides[presuMes][catId];
+  else META.overrides[presuMes][catId] = Math.round(n);
+  if (!Object.keys(META.overrides[presuMes]).length) delete META.overrides[presuMes];
+  await guardarConfig(); render();
+}
+async function quitarOverride(catId){
+  if (META.overrides && META.overrides[presuMes]){ delete META.overrides[presuMes][catId];
+    if (!Object.keys(META.overrides[presuMes]).length) delete META.overrides[presuMes]; }
+  await guardarConfig(); render();
 }
 async function fijarPlan(catId, valor){
   const c = catById(catId); if(!c) return;
