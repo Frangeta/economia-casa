@@ -745,6 +745,7 @@ function vResumen(){
     </div>
     ${htmlPrevision(mesSel)}
     ${htmlAvisoSubidas()}
+    ${htmlAvisoAnomalos(mesSel)}
     <div class="card">
       <div class="row"><span class="micro muted">En qué se convierte el mes</span><span class="micro muted mono">${fmtEUR(total)}</span></div>
       <div class="cinta">${segs}${wBal>0?`<div style="width:${wBal}%;background:var(--ingreso)" title="Balance ${fmtEUR(balance)}"></div>`:''}</div>
@@ -805,6 +806,26 @@ function htmlAvisoSubidas(){
       <div class="tiny" style="color:var(--gasto)">unos ${fmtEUR(extra)}/mes más que al principio · ver detalle</div></span></span>
       <span style="color:var(--gasto)">›</span></div>
   </div>`;
+}
+
+// aviso de gastos inusualmente altos del mes que se está viendo
+function htmlAvisoAnomalos(ym){
+  const an = anomalosMes(ym);
+  if (!an.length) return '';
+  return `<div class="card" style="box-shadow:none;background:var(--plan-bg)">
+    <div class="row" style="align-items:center;margin-bottom:8px"><span class="gnom" style="gap:10px"><span style="font-size:20px">👀</span>
+      <strong style="color:var(--plan)">Gasto${an.length>1?'s':''} inusualmente alto${an.length>1?'s':''} este mes</strong></span></div>
+    ${an.slice(0,5).map(a=>`<div class="catrow" onclick="verMovId('${a.id}')">
+      <span class="gnom" style="gap:8px"><span class="gic" style="width:24px;height:24px;background:var(--card)">${iconoGrupo(catById(a.catId)?.grupo)}</span>
+        <span>${esc(a.concepto)}<div class="tiny muted">${catById(a.catId)?.nombre||''} · ${a.veces}× lo habitual</div></span></span>
+      <span class="mono neg">${fmtEUR(a.importe)}</span>
+    </div>`).join('')}
+    <div class="tiny muted" style="margin-top:6px">No es necesariamente un error: puede ser una compra grande o puntual. Toca para revisarlo.</div>
+  </div>`;
+}
+function verMovId(id){
+  const m = MOVS.find(x=>x.id===id); if(!m) return;
+  filtroCat=''; filtroTxt = conceptoDe(m).clave.toLowerCase(); vista='movimientos'; render(); window.scrollTo(0,0);
 }
 
 // barra previsto vs real. Para ingresos/gastos (siempre >=0) barra normal;
@@ -1114,6 +1135,52 @@ function detectarRecurrentes(){
 }
 // para el aviso destacado solo cuentan recibos de verdad que suben (no restauración puntual)
 function recurrentesConSubida(){ return detectarRecurrentes().filter(r=>r.subidaPct>=8 && r.esRecibo); }
+
+/* Detección de gastos anómalos: importes muy por encima de lo normal en su categoría.
+   Excluye flujos internos y traspasos/Bizums a uno mismo (no son gasto real). */
+function detectarAnomalos(mesFiltro){
+  // estadísticas por categoría de gasto sobre todo el histórico
+  const porCat = {};
+  for (const m of MOVS){
+    if (m.importe>=0 || !m.categoriaId) continue;
+    const c = catById(m.categoriaId);
+    if (!c || c.tipo!=='gasto') continue;              // solo gasto real (excluye internos/ingresos)
+    (porCat[m.categoriaId] = porCat[m.categoriaId]||[]).push(-m.importe);
+  }
+  const stats = {};
+  for (const cid in porCat){
+    const arr = porCat[cid];
+    const media = arr.reduce((a,b)=>a+b,0)/arr.length;
+    const sd = Math.sqrt(arr.reduce((s,x)=>s+(x-media)**2,0)/arr.length);
+    stats[cid] = {media, sd, n:arr.length};
+  }
+  const propios = new Set([...(REGLAS.nombresPropios||[])].map(s=>s.toLowerCase()));
+  const anom = [];
+  for (const m of MOVS){
+    if (m.importe>=0 || !m.categoriaId) continue;
+    if (mesFiltro && m.ym!==mesFiltro) continue;
+    const c = catById(m.categoriaId);
+    if (!c || c.tipo!=='gasto') continue;
+    // excluir traspasos/Bizums a uno mismo aunque estén como gasto
+    const con = conceptoDe(m);
+    const claveL = con.clave.toLowerCase();
+    const desc = (m.descripcion||'').toLowerCase();
+    const esPropio = [...propios].some(p=>p && (claveL.includes(p) || desc.includes(p)));
+    const esTraspaso = /traspaso/.test(desc);
+    if (esPropio || esTraspaso) continue;
+    const s = stats[m.categoriaId];
+    if (!s || s.n<8) continue;                         // categoría con pocos datos: no fiable
+    const v = -m.importe;
+    const umbral = Math.max(s.media + 3*s.sd, s.media*2.5);  // muy por encima de lo habitual
+    if (v>=umbral && v>=100){
+      anom.push({id:m.id, fecha:m.fecha, ym:m.ym, importe:v, catId:m.categoriaId,
+        concepto: con.clave, media:s.media, veces:+(v/s.media).toFixed(1)});
+    }
+  }
+  anom.sort((a,b)=>b.fecha.localeCompare(a.fecha) || b.importe-a.importe);
+  return anom;
+}
+function anomalosMes(ym){ return detectarAnomalos(ym); }
 
 
 function pintarGraficas(){
