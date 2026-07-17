@@ -43,9 +43,9 @@ main{padding:0 14px}
 .mespicker .mes{font-family:'Fraunces',serif;font-size:18px;font-weight:600;text-transform:capitalize}
 
 /* KPIs */
-.kpis{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px}
-.kpi{background:var(--card);border:none;border-radius:16px;padding:14px;box-shadow:var(--sombra)}
-.kpi .ic{width:30px;height:30px;border-radius:9px;display:flex;align-items:center;justify-content:center;margin-bottom:9px}
+.kpis{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px}
+.kpi{background:var(--card);border:none;border-radius:16px;padding:15px 13px 16px;box-shadow:var(--sombra)}
+.kpi .ic{width:32px;height:32px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:10px}
 .kpi .ic svg{width:17px;height:17px;stroke-width:2;fill:none;stroke-linecap:round;stroke-linejoin:round}
 .kpi .lbl{font-size:11px;color:var(--muted);margin-bottom:2px}
 .kpi .val{font-family:'Fraunces',serif;font-weight:600;font-size:20px;font-variant-numeric:tabular-nums;letter-spacing:-0.01em}
@@ -111,14 +111,20 @@ input:focus,select:focus,button:focus-visible{outline:2px solid var(--marca);out
 #hoja label{font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);display:block;margin-bottom:4px}
 
 /* nav inferior */
-nav{position:fixed;bottom:0;left:0;right:0;background:rgba(255,255,255,.92);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-top:1px solid var(--line);display:flex;max-width:680px;margin:0 auto;z-index:10;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding:6px 2px 8px}
-nav::-webkit-scrollbar{display:none}
-nav button{flex:1 0 auto;min-width:62px;background:none;border:none;padding:4px 4px;font-size:10px;color:var(--muted);cursor:pointer;font-family:inherit;position:relative;white-space:nowrap;display:flex;flex-direction:column;align-items:center;gap:3px}
+nav{position:fixed;bottom:0;left:0;right:0;background:rgba(255,255,255,.92);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-top:1px solid var(--line);display:flex;max-width:680px;margin:0 auto;z-index:10;padding:6px 2px 8px}
+nav button{flex:1;background:none;border:none;padding:4px 4px;font-size:10px;color:var(--muted);cursor:pointer;font-family:inherit;position:relative;white-space:nowrap;display:flex;flex-direction:column;align-items:center;gap:3px}
 nav button.on{color:var(--marca);font-weight:600}
 nav button .navic{width:42px;height:28px;border-radius:12px;display:flex;align-items:center;justify-content:center;transition:background .15s}
 nav button.on .navic{background:var(--marca-bg)}
 nav button .badge{position:absolute;top:-1px;right:calc(50% - 24px);background:var(--gasto);color:#fff;font-size:9px;border-radius:8px;padding:0 5px;min-width:15px;text-align:center}
 nav button svg{width:20px;height:20px;stroke:currentColor;stroke-width:1.9;fill:none;stroke-linecap:round;stroke-linejoin:round}
+.mas-lista{margin-top:8px}
+.mas-item{display:flex;align-items:center;gap:12px;width:100%;background:none;border:none;border-radius:12px;padding:14px 12px;font-size:15px;font-family:inherit;color:var(--ink);cursor:pointer;text-align:left}
+.mas-item:hover{background:var(--bg)}
+.mas-item .mas-ic{width:38px;height:38px;border-radius:11px;background:var(--marca-bg);display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.mas-item .mas-ic svg{width:20px;height:20px;stroke:var(--marca);stroke-width:1.9;fill:none;stroke-linecap:round;stroke-linejoin:round}
+.mas-item>span:nth-child(2){flex:1}
+.mas-item .mas-fl{color:var(--muted);font-size:18px}
 
 .vacio{text-align:center;color:var(--muted);padding:36px 16px;font-size:14px}
 h2.seccion{font-family:'Fraunces',serif;font-weight:600;font-size:16px;margin:18px 4px 10px;letter-spacing:-0.01em}
@@ -137,6 +143,16 @@ h2.seccion{font-family:'Fraunces',serif;font-weight:600;font-size:16px;margin:18
 .presu-input input{width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-align:right;font-variant-numeric:tabular-nums;font-family:inherit}
 .presu-input input.ajustado{border-color:var(--plan);background:var(--plan-bg);font-weight:600;color:var(--plan)}
 .presu-x{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer;width:22px;text-align:center;padding:0}
+
+/* avisos unificados */
+.avisos{background:var(--card);border-radius:14px;margin-bottom:12px;box-shadow:var(--sombra);overflow:hidden}
+.avisos-cab{display:flex;align-items:center;justify-content:space-between;padding:13px 15px;cursor:pointer}
+.avisos-izq{display:flex;align-items:center;gap:8px;font-size:14px}
+.avisos-punto{width:8px;height:8px;border-radius:50%;background:var(--plan);flex-shrink:0;box-shadow:0 0 0 3px var(--plan-bg)}
+.avisos-fl{color:var(--muted);font-size:11px}
+.avisos-cuerpo{padding:0 15px 8px}
+.aviso-grupo{border-top:1px solid var(--line);padding-top:8px;margin-top:4px}
+.aviso-tit{font-size:12px;color:var(--muted);margin-bottom:2px;padding:0 6px}
 
 /* login */
 #login .box{background:var(--card);border:none;border-radius:20px;padding:30px 26px;max-width:360px;width:100%;box-shadow:var(--sombra)}
@@ -693,16 +709,34 @@ const ICONS = {
   presupuesto:'<svg viewBox="0 0 24 24"><path d="M4 5h16v14H4zM4 10h16M9 15h6"/></svg>',
   bandeja:'<svg viewBox="0 0 24 24"><path d="M4 13l3 5h10l3-5M4 13V6h16v7M4 13h5l1.5 2h3L15 13h5"/></svg>',
   importar:'<svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 19h16"/></svg>',
-  ajustes:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2"/></svg>'
+  ajustes:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2"/></svg>',
+  mas:'<svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>'
 };
-const NAV_LABEL = {resumen:'Resumen', movimientos:'Movim.', analisis:'Análisis', presupuesto:'Presup.', bandeja:'Bandeja', importar:'Importar', ajustes:'Ajustes'};
+const NAV_LABEL = {resumen:'Resumen', movimientos:'Movim.', analisis:'Análisis', presupuesto:'Presup.', bandeja:'Bandeja', importar:'Importar', ajustes:'Ajustes', mas:'Más'};
+const NAV_PRINCIPAL = ['resumen','movimientos','analisis','presupuesto','mas'];
+const NAV_MAS = ['bandeja','importar','ajustes'];
 function renderNav(){
   const nb = bandeja().length;
-  $('#nav').innerHTML = ['resumen','movimientos','analisis','presupuesto','bandeja','importar','ajustes'].map(v=>
-    `<button class="${v===vista?'on':''}" onclick="irA('${v}')"><span class="navic">${ICONS[v]}</span>${NAV_LABEL[v]}${v==='bandeja'&&nb?`<span class="badge">${nb>99?'99+':nb}</span>`:''}</button>`
-  ).join('');
+  // "Más" muestra punto si hay algo pendiente en bandeja
+  $('#nav').innerHTML = NAV_PRINCIPAL.map(v=>{
+    const activo = v===vista || (v==='mas' && NAV_MAS.includes(vista));
+    const badge = v==='mas' && nb ? `<span class="badge">${nb>99?'99+':nb}</span>` : '';
+    return `<button class="${activo?'on':''}" onclick="${v==='mas'?'abrirMas()':`irA('${v}')`}"><span class="navic">${ICONS[v]}</span>${NAV_LABEL[v]}${badge}</button>`;
+  }).join('');
   $('#hdr-cuenta').textContent = META.cuenta ? '···'+META.cuenta.replace(/\s/g,'').slice(-4) : '';
 }
+function abrirMas(){
+  const nb = bandeja().length;
+  const items = NAV_MAS.map(v=>{
+    const badge = v==='bandeja'&&nb?` <span class="pill rev">${nb}</span>`:'';
+    return `<button class="mas-item" onclick="cerrarMas();irA('${v}')"><span class="mas-ic">${ICONS[v]}</span><span>${NAV_LABEL[v]}${badge}</span><span class="mas-fl">›</span></button>`;
+  }).join('');
+  const velo = document.getElementById('velo');
+  const hoja = document.getElementById('hoja');
+  hoja.innerHTML = `<h3>Más opciones</h3><div class="mas-lista">${items}</div>`;
+  velo.style.display='block'; hoja.style.display='block';
+}
+function cerrarMas(){ document.getElementById('velo').style.display='none'; document.getElementById('hoja').style.display='none'; }
 function irA(v){
   if (v==='movimientos' && vista!=='movimientos'){ filtroCat=''; filtroTxt=''; }
   vista=v; render(); window.scrollTo(0,0);
@@ -744,8 +778,7 @@ function vResumen(){
       <div class="kpi"><div class="ic" style="background:var(--marca-bg)"><svg style="stroke:var(--marca)" viewBox="0 0 24 24"><path d="M3 12h18M12 3v18"/></svg></div><div class="lbl">Balance</div><div class="val" style="color:var(--marca)">${fmtEUR(balance)}</div><div class="sub">${tasa!=null?tasa+'% de ahorro':''}</div></div>
     </div>
     ${htmlPrevision(mesSel)}
-    ${htmlAvisoSubidas()}
-    ${htmlAvisoAnomalos(mesSel)}
+    ${htmlAvisos(mesSel)}
     <div class="card">
       <div class="row"><span class="micro muted">En qué se convierte el mes</span><span class="micro muted mono">${fmtEUR(total)}</span></div>
       <div class="cinta">${segs}${wBal>0?`<div style="width:${wBal}%;background:var(--ingreso)" title="Balance ${fmtEUR(balance)}"></div>`:''}</div>
@@ -796,36 +829,35 @@ function htmlIngresos(R){
 let previsionAbierta = false;
 function togglePrevision(){ previsionAbierta = !previsionAbierta; render(); }
 // aviso compacto en el Resumen si hay recibos que han subido de precio
-function htmlAvisoSubidas(){
-  const suben = recurrentesConSubida();
-  if (!suben.length) return '';
-  const extra = suben.reduce((s,r)=>s+(r.actual-r.inicial),0);
-  return `<div class="card" style="background:var(--gasto-bg);box-shadow:none;cursor:pointer" onclick="irA('analisis')">
-    <div class="row" style="align-items:center"><span class="gnom" style="gap:10px"><span style="font-size:20px">📈</span>
-      <span><strong style="color:var(--gasto)">${suben.length} recibo${suben.length>1?'s han':' ha'} subido de precio</strong>
-      <div class="tiny" style="color:var(--gasto)">unos ${fmtEUR(extra)}/mes más que al principio · ver detalle</div></span></span>
-      <span style="color:var(--gasto)">›</span></div>
-  </div>`;
-}
-
-// aviso de gastos inusualmente altos del mes que se está viendo
-function htmlAvisoAnomalos(ym){
-  const an = anomalosMes(ym);
-  if (!an.length) return '';
-  return `<div class="card" style="box-shadow:none;background:var(--plan-bg)">
-    <div class="row" style="align-items:center;margin-bottom:8px"><span class="gnom" style="gap:10px"><span style="font-size:20px">👀</span>
-      <strong style="color:var(--plan)">Gasto${an.length>1?'s':''} inusualmente alto${an.length>1?'s':''} este mes</strong></span></div>
-    ${an.slice(0,5).map(a=>`<div class="catrow" onclick="verMovId('${a.id}')">
-      <span class="gnom" style="gap:8px"><span class="gic" style="width:24px;height:24px;background:var(--card)">${iconoGrupo(catById(a.catId)?.grupo)}</span>
-        <span>${esc(a.concepto)}<div class="tiny muted">${catById(a.catId)?.nombre||''} · ${a.veces}× lo habitual</div></span></span>
-      <span class="mono neg">${fmtEUR(a.importe)}</span>
-    </div>`).join('')}
-    <div class="tiny muted" style="margin-top:6px">No es necesariamente un error: puede ser una compra grande o puntual. Toca para revisarlo.</div>
-  </div>`;
-}
+let avisosAbierto = false;
 function verMovId(id){
   const m = MOVS.find(x=>x.id===id); if(!m) return;
   filtroCat=''; filtroTxt = conceptoDe(m).clave.toLowerCase(); vista='movimientos'; render(); window.scrollTo(0,0);
+}
+function toggleAvisos(){ avisosAbierto = !avisosAbierto; render(); }
+// Aviso unificado y discreto: una tira con el nº de avisos; al tocar despliega el detalle.
+function htmlAvisos(ym){
+  const suben = recurrentesConSubida();
+  const anom = anomalosMes(ym);
+  const total = suben.length + anom.length;
+  if (!total) return '';
+  const resumenTxt = [
+    suben.length ? `${suben.length} recibo${suben.length>1?'s':''} al alza` : '',
+    anom.length ? `${anom.length} gasto${anom.length>1?'s':''} alto${anom.length>1?'s':''}` : ''
+  ].filter(Boolean).join(' · ');
+  return `<div class="avisos ${avisosAbierto?'abierto':''}">
+    <div class="avisos-cab" onclick="toggleAvisos()">
+      <span class="avisos-izq"><span class="avisos-punto"></span><strong>${total} aviso${total>1?'s':''}</strong> <span class="muted micro">${resumenTxt}</span></span>
+      <span class="avisos-fl">${avisosAbierto?'▲':'▼'}</span>
+    </div>
+    ${avisosAbierto?`<div class="avisos-cuerpo">
+      ${suben.length?`<div class="aviso-grupo"><div class="aviso-tit">📈 Recibos que han subido</div>
+        ${suben.slice(0,5).map(r=>`<div class="catrow" onclick="verRecurrente('${esc(r.claveRaw)}')"><span>${esc(r.clave)}</span><span class="mono neg">+${Math.round(r.subidaPct)}% · ${fmtEUR(r.actual)}</span></div>`).join('')}
+        <div class="tiny muted" style="padding:4px 6px">Ver todos en Análisis › Gastos recurrentes</div></div>`:''}
+      ${anom.length?`<div class="aviso-grupo"><div class="aviso-tit">👀 Gastos altos este mes</div>
+        ${anom.slice(0,5).map(a=>`<div class="catrow" onclick="verMovId('${a.id}')"><span>${esc(a.concepto)} <span class="tiny muted">${a.veces}×</span></span><span class="mono neg">${fmtEUR(a.importe)}</span></div>`).join('')}</div>`:''}
+    </div>`:''}
+  </div>`;
 }
 
 // barra previsto vs real. Para ingresos/gastos (siempre >=0) barra normal;
