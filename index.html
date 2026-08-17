@@ -311,40 +311,73 @@ function parseMC(rows, headerIdx){
 }
 
 /* ============ MOTOR DE CATEGORIZACIÓN ============ */
+// Trocea la descripción en sus partes de concepto (separadas por "|") en vez de tratarla
+// como un único texto plano. Así una coincidencia de nombre/cuenta propia en una parte no
+// compite con palabras sueltas de otra parte (p.ej. un memo de transferencia que además
+// contenga algo parecido a una palabra clave de comercio).
+// Marcadores de que un movimiento es una compra con tarjeta (no una transferencia). Se usan
+// tanto para no perder el nombre del titular al elegir "concepto" (conceptoDe) como para no
+// dejar que ese mismo nombre, si aparece en el ticket de una compra, la convierta en un traspaso.
+const MARCADORES_TARJETA = ['COMPRA CON TARJETA','OPERACION TARJETA','CUOTA T'];
+function partesConcepto(mov){
+  return (mov.descripcion||'').split('|').map(s=>s.trim().toUpperCase()).filter(Boolean);
+}
 function categorizar(mov, R){
   const D = (mov.descripcion||'').toUpperCase();
   const dl = D.toLowerCase();
+  const partes = partesConcepto(mov);
+  const enAlgunConcepto = valor => partes.some(p=>p.includes(valor));
+  const esCompraConTarjeta = MARCADORES_TARJETA.some(g=>D.includes(g));
+  const porNombrePropio = () => { for (const n of (R.nombresPropios||[])) if (enAlgunConcepto(n.toUpperCase())) return true; return false; };
   // 1) cuentas de ahorro propias
-  for (const c of (R.cuentasAhorro||[])) if (D.includes(c.toUpperCase())) return {cat:'ahorro', via:'regla'};
+  for (const c of (R.cuentasAhorro||[])) if (enAlgunConcepto(c.toUpperCase())) return {cat:'ahorro', via:'regla'};
   // 2) otras cuentas / bancos propios
-  for (const c of (R.cuentasPropias||[])) if (D.includes(c.toUpperCase())) return {cat:'traspasos', via:'regla'};
-  // 3) diccionario de comercios: gana la clave más larga
+  for (const c of (R.cuentasPropias||[])) if (enAlgunConcepto(c.toUpperCase())) return {cat:'traspasos', via:'regla'};
+  // 3) nombre del titular u otro nombre propio en cualquier parte del concepto => traspaso entre
+  //    cuentas propias. Prioridad alta (antes que comercios y palabras clave): un traspaso
+  //    identificado por el nombre del titular (habitual en el concepto de las transferencias) no
+  //    debe perderse frente a coincidencias de texto de otra parte del mismo concepto (p.ej. un
+  //    memo que mencione un lugar o un bono que case con una palabra clave). Se excluyen aquí las
+  //    compras con tarjeta: si el ticket de una compra real incluye también el nombre del titular,
+  //    no debe convertirse en un traspaso (se comprueba más abajo, como última red de seguridad).
+  if (!esCompraConTarjeta && porNombrePropio()) return {cat:'traspasos', via:'regla'};
+  // 4) diccionario de comercios: gana la clave más larga
   let best=null;
   for (const k in R.comercios){ if (dl.includes(k) && (!best || k.length>best[0].length)) best=[k,R.comercios[k]]; }
   if (best) return {cat:best[1], via:'dict'};
-  // 4) palabras clave (orden)
+  // 5) palabras clave (orden)
   for (const [cat,kws] of R.palabrasClave){ for (const kw of kws){ if (D.includes(kw)) return {cat, via:'regla'}; } }
-  // 5) Bizum
+  // 6) Bizum
   const esBizum = D.includes('BIZUM') || (mov.raw.codComun==='04' && mov.raw.codPropio==='002');
   if (esBizum) return {cat: mov.importe<0?'bizum_env':'bizum_rec', via:'codigo'};
-  // 6) nombre del titular => traspaso entre cuentas propias
-  for (const n of (R.nombresPropios||[])) if (D.includes(n.toUpperCase())) return {cat:'traspasos', via:'regla'};
   // 7) códigos CaixaBank
   if (mov.raw.codComun && R.codigos && R.codigos[mov.raw.codComun]) return {cat:R.codigos[mov.raw.codComun], via:'codigo'};
+  // 8) último recurso: nombre propio en una compra con tarjeta sin comercio ni palabra clave
+  //    reconocidos (mejor detectarlo como traspaso que dejarlo sin clasificar).
+  if (esCompraConTarjeta && porNombrePropio()) return {cat:'traspasos', via:'regla'};
   return null;
 }
 
-/* concepto agrupador para la bandeja: persona del Bizum o comercio dominante */
-function conceptoDe(mov){
+/* concepto agrupador para la bandeja: persona del Bizum o comercio dominante.
+   R (por defecto REGLAS) se usa para no elegir como "comercio" una parte del concepto que en
+   realidad sea tu nombre o una de tus cuentas: eso aparece en muchísimos movimientos distintos
+   (es el titular, no el comercio) y usarlo como clave de "aplicar a similares" propondría
+   recategorizar en bloque movimientos que no tienen nada que ver entre sí. */
+function conceptoDe(mov, R=REGLAS){
   const partes = (mov.descripcion||'').split('|').map(s=>s.trim()).filter(Boolean);
   const pers = partes.find(p=>/^[A-ZÁÉÍÓÚÑa-záéíóúñ .-]+;[A-ZÁÉÍÓÚÑa-záéíóúñ .;-]+$/.test(p));
   if (pers) return {tipo:'persona', clave: pers.replace(/;/g,' ').replace(/\s+/g,' ').trim()};
-  const GEN = ['COMPRA CON TARJETA','OPERACION TARJETA','CUOTA T'];
+  const GEN = MARCADORES_TARJETA;
+  const propios = [...(R?.cuentasAhorro||[]), ...(R?.cuentasPropias||[]), ...(R?.nombresPropios||[])].map(s=>s.toUpperCase());
+  const esParteDeMiPropiaCuenta = P => propios.some(pr=>pr && P.includes(pr));
+  let huboPropio = false;
   for (const p of partes){
     const P = p.toUpperCase();
+    if (esParteDeMiPropiaCuenta(P)){ huboPropio = true; continue; }
     if (/[A-ZÁÉÍÓÚÑ]{3}/.test(P) && !GEN.some(g=>P.includes(g)) && !P.startsWith('ABONO') && !P.startsWith('PAGO '))
       return {tipo:'comercio', clave: p.replace(/\s+ES\d{2}.*$/,'').slice(0,34).trim()};
   }
+  if (huboPropio) return {tipo:'traspaso', clave:'Traspaso entre cuentas propias'};
   if (partes.some(p=>p.toUpperCase().startsWith('CUOTA T'))) return {tipo:'comercio', clave:'CUOTA TARJETA'};
   return {tipo:'comercio', clave:'Compra con tarjeta sin comercio'};
 }
@@ -807,6 +840,7 @@ function vResumen(){
       <div class="kpi"><div class="ic" style="background:var(--gasto-bg)"><svg style="stroke:var(--gasto)" viewBox="0 0 24 24"><path d="M12 5v14M5 12l7 7 7-7"/></svg></div><div class="lbl">Gasto real</div><div class="val neg">${fmtEUR(R.gasReal)}</div></div>
       <div class="kpi"><div class="ic" style="background:var(--marca-bg)"><svg style="stroke:var(--marca)" viewBox="0 0 24 24"><path d="M3 12h18M12 3v18"/></svg></div><div class="lbl">Balance</div><div class="val" style="color:var(--marca)">${fmtEUR(balance)}</div><div class="sub">${tasa!=null?tasa+'% de ahorro':''}</div></div>
     </div>
+    ${htmlComparativaGasto(mesSel)}
     ${htmlPrevision(mesSel)}
     ${htmlAvisos(mesSel)}
     <div class="card">
@@ -840,6 +874,49 @@ function vResumen(){
     }).join('')}
     ${htmlIngresos(R)}
   `;
+}
+// Comparativa sencilla: gasto de este mes vs el anterior, con una mini-tendencia de los últimos meses
+function htmlComparativaGasto(ym){
+  const ms = meses();
+  const idx = ms.indexOf(ym);
+  const gastoMes = resumenMes(ym).gasReal;
+  const ymAnterior = idx>0 ? ms[idx-1] : null;
+  if (!ymAnterior){
+    return `<div class="card">
+      <div class="micro muted">Gasto este mes</div>
+      <div class="serif" style="font-size:20px;font-weight:600;margin-top:2px">${fmtEUR(gastoMes)}</div>
+      <div class="tiny muted" style="margin-top:2px">Aún no hay un mes anterior con el que comparar.</div>
+    </div>`;
+  }
+  const gastoAnterior = resumenMes(ymAnterior).gasReal;
+  const diff = r2(gastoMes - gastoAnterior);
+  const pct = gastoAnterior>0 ? Math.round(diff/gastoAnterior*100) : null;
+  const peor = diff>0; // más gasto que el mes anterior
+  // tendencia: hasta 6 meses cerrados hasta el mes seleccionado (incluido)
+  const serieCompleta = serieMeses(6).filter(m=>ms.indexOf(m)<=idx);
+  const valores = serieCompleta.map(m=>resumenMes(m).gasReal);
+  const max = Math.max(...valores, 1);
+  const barras = serieCompleta.map((m,i)=>{
+    const h = Math.max(valores[i]/max*100, 4);
+    const esMesSel = m===ym;
+    return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px">
+      <div style="width:100%;height:36px;display:flex;align-items:flex-end">
+        <div style="width:100%;border-radius:3px 3px 0 0;height:${h}%;background:${esMesSel?'var(--gasto)':'var(--line)'}" title="${nombreMesCorto(m)}: ${fmtEUR(valores[i])}"></div>
+      </div>
+      <span class="tiny muted">${nombreMesCorto(m)}</span>
+    </div>`;
+  }).join('');
+  return `<div class="card">
+    <div class="row" style="align-items:baseline">
+      <span class="micro muted">Gasto este mes vs mes anterior</span>
+      <span class="micro mono ${peor?'neg':'pos'}">${diff>=0?'+':''}${fmtEUR(diff)}${pct!=null?` (${diff>=0?'+':''}${pct}%)`:''}</span>
+    </div>
+    <div class="row" style="margin-top:4px;align-items:baseline">
+      <span class="serif" style="font-size:20px;font-weight:600">${fmtEUR(gastoMes)}</span>
+      <span class="tiny muted">vs ${fmtEUR(gastoAnterior)} en ${nombreMesCorto(ymAnterior)}</span>
+    </div>
+    ${serieCompleta.length>1?`<div style="display:flex;gap:6px;margin-top:12px">${barras}</div>`:''}
+  </div>`;
 }
 // Desglose de ingresos del mes por origen, navegable a sus movimientos
 function htmlIngresos(R){
@@ -1718,6 +1795,21 @@ function vAjustes(){
       ${REGLAS.nombresPropios&&REGLAS.nombresPropios.length ? '<span class="pill">cargados</span>' : `<button class="btn" onclick="document.getElementById('fichpriv').click()">Cargar datos privados</button>
       <input type="file" id="fichpriv" accept=".js,.json" style="display:none" onchange="cargarPrivados(this.files)">`}
     </div>
+    <h2 class="seccion">Cuentas y nombres propios</h2>
+    <div class="card">
+      <p class="micro muted" style="margin-top:0">Se usan para reconocer traspasos entre tus propias cuentas (y no confundirlos con gastos), y tienen prioridad sobre comercios y palabras clave. Toca un elemento para quitarlo.</p>
+      ${['cuentasAhorro','cuentasPropias','nombresPropios'].map(campo=>`
+        <div style="margin-bottom:14px">
+          <label style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);display:block;margin-bottom:6px">${etiquetaCampoPropio(campo)}</label>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">
+            ${(REGLAS[campo]||[]).length ? (REGLAS[campo]||[]).map(v=>`<span class="pill" data-campo="${campo}" data-valor="${esc(v)}" onclick="quitarPropio(this)" style="cursor:pointer" title="Tocar para quitar">${esc(v)} ✕</span>`).join('') : '<span class="tiny muted">Ninguno todavía.</span>'}
+          </div>
+          <div style="display:flex;gap:8px">
+            <input type="text" id="in-${campo}" placeholder="Añadir…" onkeydown="if(event.key==='Enter'){anadirPropio('${campo}')}">
+            <button class="btn sec" onclick="anadirPropio('${campo}')">Añadir</button>
+          </div>
+        </div>`).join('')}
+    </div>
     <h2 class="seccion">Copia de seguridad</h2>
     <div class="card">
       <p class="micro muted" style="margin-top:0">La copia incluye movimientos, categorías, reglas aprendidas y configuración. Guárdala donde quieras; se restaura desde aquí mismo.</p>
@@ -1730,6 +1822,30 @@ function vAjustes(){
       <button class="btn peligro" onclick="borrarTodo()">Borrar todos los datos</button>
       <button class="btn sec" onclick="recategorizarTodo()">Recategorizar (respeta manuales)</button>
     </div>`;
+}
+function etiquetaCampoPropio(campo){
+  return {
+    cuentasAhorro: 'Cuentas de ahorro propias (categoría Ahorro)',
+    cuentasPropias: 'Otras cuentas propias (categoría Traspasos)',
+    nombresPropios: 'Nombres propios / familiares (categoría Traspasos)'
+  }[campo] || campo;
+}
+async function anadirPropio(campo){
+  const input = document.getElementById('in-'+campo); if (!input) return;
+  const v = (input.value||'').trim();
+  if (!v) return;
+  REGLAS[campo] = REGLAS[campo] || [];
+  if (!REGLAS[campo].some(x=>x.toLowerCase()===v.toLowerCase())) REGLAS[campo].push(v);
+  input.value = '';
+  await guardarConfig();
+  await recategorizarTodo();
+}
+async function quitarPropio(el){
+  const campo = el.dataset.campo, valor = el.dataset.valor;
+  if (!confirm('¿Quitar "'+valor+'" de '+etiquetaCampoPropio(campo)+'?')) return;
+  REGLAS[campo] = (REGLAS[campo]||[]).filter(x=>x!==valor);
+  await guardarConfig();
+  await recategorizarTodo();
 }
 async function cargarPrivados(files){
   if (!files || !files.length) return;
@@ -1880,7 +1996,33 @@ async function hacerLogin(){
     err.textContent = msg;
   } finally { btn.disabled=false; btn.textContent='Entrar'; }
 }
-async function cerrarSesion(){ await AUTH.signOut(); location.reload(); }
+async function cerrarSesion(){ localStorage.removeItem(LS_ACTIVIDAD); await AUTH.signOut(); location.reload(); }
+
+/* ---- Caducidad de sesión por inactividad (1 hora) ----
+   Pasada una hora sin interacción con la app, se cierra la sesión y hay que volver a
+   meter usuario y contraseña. Se guarda la marca de tiempo en localStorage (no en Firestore)
+   para que sobreviva a recargas y a cerrar/abrir la app. */
+const SESION_MAX_MS = 60*60*1000;
+const LS_ACTIVIDAD = 'eco.ultimaActividad';
+let sesionCaducando = false;
+function marcarActividad(){ try{ localStorage.setItem(LS_ACTIVIDAD, String(Date.now())); }catch(e){} }
+function sesionCaducada(){
+  const v = +(localStorage.getItem(LS_ACTIVIDAD)||0);
+  return v>0 && (Date.now()-v) > SESION_MAX_MS;
+}
+async function comprobarCaducidadSesion(){
+  if (!UID || sesionCaducando) return;
+  if (sesionCaducada()){
+    sesionCaducando = true;
+    localStorage.removeItem(LS_ACTIVIDAD);
+    await AUTH.signOut();
+    alert('Tu sesión ha caducado por inactividad. Vuelve a entrar con tu usuario y contraseña.');
+    location.reload();
+  }
+}
+['click','keydown','touchstart','pointerdown'].forEach(ev=>document.addEventListener(ev, marcarActividad, {passive:true}));
+document.addEventListener('visibilitychange', ()=>{ if (document.visibilityState==='visible') comprobarCaducidadSesion(); });
+setInterval(comprobarCaducidadSesion, 60*1000);
 
 function mostrarLogin(){ document.getElementById('login').style.display='flex'; document.getElementById('app').style.display='none'; }
 // saludo amable con el nombre antes de la @ y emoji según la hora
@@ -1894,6 +2036,15 @@ function saludoTexto(email){
 
 AUTH.onAuthStateChanged(async user => {
   if (!user){ mostrarLogin(); return; }
+  // si la sesión llevaba más de una hora sin actividad (p.ej. la app estuvo cerrada o en
+  // segundo plano), se cierra aquí mismo antes de mostrar nada; onAuthStateChanged volverá
+  // a dispararse con user=null y aparecerá la pantalla de login.
+  if (sesionCaducada()){
+    localStorage.removeItem(LS_ACTIVIDAD);
+    await AUTH.signOut();
+    return;
+  }
+  marcarActividad();
   UID = user.uid;
   document.getElementById('login').style.display='none';
   document.getElementById('app').style.display='block';
