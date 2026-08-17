@@ -935,26 +935,30 @@ function htmlIngresos(R){
     </div>`;
 }
 // Desglose de los flujos internos del mes (ahorro, traspasos entre cuentas propias,
-// devoluciones): no son gasto ni ingreso real, pero conviene poder verlos y comprobar que
-// se han categorizado bien, con navegación directa a sus movimientos.
+// devoluciones): no son gasto ni ingreso real, pero conviene poder ver cuánto sale y cuánto
+// entra en cada uno (no solo el neto) y comprobar que se han categorizado bien, con
+// navegación directa a sus movimientos.
 function htmlFlujosInternos(ym){
   const porCat = {};
   for (const m of movsMes(ym)){
     const c = catById(m.categoriaId);
     if (!c || c.tipo!=='interno') continue;
-    porCat[c.id] = (porCat[c.id]||0) + m.importe;
+    const e = (porCat[c.id] = porCat[c.id] || {sale:0, entra:0});
+    if (m.importe<0) e.sale += -m.importe; else e.entra += m.importe;
   }
-  const items = Object.entries(porCat).map(([cid,v])=>({cid, v:r2(v), c:catById(cid)}))
-    .sort((a,b)=>Math.abs(b.v)-Math.abs(a.v));
+  const items = Object.entries(porCat).map(([cid,v])=>({cid, sale:r2(v.sale), entra:r2(v.entra), neto:r2(v.entra-v.sale), c:catById(cid)}))
+    .sort((a,b)=>Math.max(b.sale,b.entra)-Math.max(a.sale,a.entra));
   if (!items.length) return '';
-  const max = Math.max(...items.map(x=>Math.abs(x.v)), 1);
+  const max = Math.max(...items.map(x=>Math.max(x.sale,x.entra)), 1);
   const icono = c => c ? (c.id==='ahorro'?'🏦':c.id==='traspasos'?'🔄':c.id==='devoluciones'?'↩️':'🔁') : '🔁';
+  const R = resumenMes(ym);
   return `<h2 class="seccion">Flujos internos <span class="tiny muted">(no cuentan como gasto)</span></h2>
     <div class="card">
-      <p class="micro muted" style="margin-top:0">Ahorro y traspasos entre tus propias cuentas, y devoluciones de compra: mueven dinero pero no afectan a tu gasto ni ingreso real. Toca para ver los movimientos.</p>
+      <p class="micro muted" style="margin-top:0">Ahorro y traspasos entre tus propias cuentas, y devoluciones de compra: mueven dinero pero no afectan a tu gasto ni ingreso real (este mes: ingresos ${fmtEUR(R.ingReal)}, gasto ${fmtEUR(R.gasReal)}). Toca una categoría para ver sus movimientos.</p>
       ${items.map(x=>`<div class="grupo" onclick="verCategoria('${x.cid}')">
-        <div class="row"><span class="gnom"><span class="gic" style="background:var(--interno-bg)">${icono(x.c)}</span>${esc(x.c?x.c.nombre:'Sin clasificar')}</span><span class="mono int">${x.v>=0?'+':''}${fmtEUR(x.v)}</span></div>
-        <div class="barra"><div class="fill" style="width:${Math.abs(x.v)/max*100}%;background:var(--interno)"></div></div>
+        <div class="row"><span class="gnom"><span class="gic" style="background:var(--interno-bg)">${icono(x.c)}</span>${esc(x.c?x.c.nombre:'Sin clasificar')}</span><span class="mono int">${x.neto>=0?'+':''}${fmtEUR(x.neto)}</span></div>
+        ${barraEntradaSalida(x.sale, x.entra, max)}
+        <div class="tiny muted" style="margin-top:4px">sale ${fmtEUR(x.sale)} · entra ${fmtEUR(x.entra)}</div>
       </div>`).join('')}
     </div>`;
 }
@@ -992,6 +996,17 @@ function htmlAvisos(ym){
   </div>`;
 }
 
+// barra divergente compacta: sale (rojo, hacia la izquierda) vs entra (verde, hacia la derecha),
+// reutiliza las mismas clases que barraBalance para no añadir CSS nuevo
+function barraEntradaSalida(sale, entra, max){
+  const escala = v => Math.min((v/max)*50, 50);
+  const wSale = escala(sale), wEntra = escala(entra);
+  return `<div class="pbar pbar-bal">
+    <div class="pbar-cero"></div>
+    ${sale?`<div class="pbar-fill" style="left:${50-wSale}%;width:${wSale}%;background:var(--gasto);border-radius:6px 0 0 6px"></div>`:''}
+    ${entra?`<div class="pbar-fill" style="left:50%;width:${wEntra}%;background:var(--ingreso);border-radius:0 6px 6px 0"></div>`:''}
+  </div>`;
+}
 // barra previsto vs real. Para ingresos/gastos (siempre >=0) barra normal;
 // para balance (puede ser negativo) barra divergente centrada en cero.
 function barraPrev(prev, real, frac, esGasto){
@@ -1200,7 +1215,7 @@ function vAnalisis(){
     <div class="card"><div class="micro muted" style="margin-bottom:6px">Gasto por grupo</div><div style="height:240px"><canvas id="ch-grupos"></canvas></div>
       <div id="leyenda-grupos" class="leyenda" style="margin-top:10px"></div></div>
     <div id="an-resumen"></div>
-    ${htmlAhorroApartado()}
+    ${htmlFlujosEvolucion()}
     <div class="card" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center" onclick="irA('simulador')">
       <span class="gnom" style="gap:10px"><span style="font-size:20px">🧮</span><strong>Simulador de ahorro</strong></span>
       <span style="color:var(--marca)">›</span>
@@ -1290,35 +1305,6 @@ function htmlRecurrentes(){
     <div class="card">${rec.map(fila).join('')}</div>`;
 }
 function verRecurrente(clave){ filtroCat=''; filtroTxt=clave; vista='movimientos'; render(); window.scrollTo(0,0); }
-
-// Panel informativo: cuánto se ha apartado a cuentas de ahorro en el periodo (no toca el balance)
-function htmlAhorroApartado(){
-  const serie = serieMeses(anPeriodo>=999 ? meses().length : anPeriodo);
-  const datos = serieAhorroApartado(serie);
-  const total = datos.reduce((s,x)=>s+x.apartado,0);
-  if (Math.abs(total)<1) return '';
-  const mesesConAporte = datos.filter(x=>x.apartado>0).length;
-  const mediaAporte = mesesConAporte ? total/mesesConAporte : 0;
-  // balance del periodo para comparar
-  const balPeriodo = serie.reduce((s,ym)=>{ const r=resumenMes(ym); return s+(r.ingReal-r.gasReal); },0);
-  const max = Math.max(...datos.map(x=>Math.abs(x.apartado)), 1);
-  return `<h2 class="seccion">Ahorro apartado 🐷</h2>
-    <div class="card">
-      <div class="row" style="margin-bottom:4px"><span class="micro muted">Movido a tus cuentas de ahorro en el periodo</span></div>
-      <div class="serif" style="font-size:26px;font-weight:600;color:var(--ingreso)">${fmtEUR(total)}</div>
-      <div class="tiny muted" style="margin-bottom:12px">unos ${fmtEUR(mediaAporte)}/mes · tu balance del periodo fue ${fmtEUR(balPeriodo)}</div>
-      ${datos.map(x=>{
-        const w = Math.abs(x.apartado)/max*100;
-        const neg = x.apartado<0;
-        return `<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">
-          <span class="tiny muted mono" style="width:48px">${nombreMesCorto(x.ym)}</span>
-          <div class="barra" style="flex:1"><div class="fill" style="width:${w}%;background:${neg?'var(--gasto)':'var(--ingreso)'}"></div></div>
-          <span class="tiny mono ${neg?'neg':'pos'}" style="width:64px;text-align:right">${fmtEUR(x.apartado)}</span>
-        </div>`;
-      }).join('')}
-      <div class="tiny muted" style="margin-top:10px">Esto no se resta de tu balance: es dinero tuyo que cambia de cuenta. Te muestra cuánto de tu margen has puesto a buen recaudo. Los meses en rojo sacaste de ahorro en vez de aportar.</div>
-    </div>`;
-}
 
 
 function datosAnalisis(){
@@ -1434,21 +1420,60 @@ function detectarAnomalos(mesFiltro){
 }
 function anomalosMes(ym){ return detectarAnomalos(ym); }
 
-/* Ahorro apartado: salidas netas a cuentas internas (ahorro + traspasos) por mes.
-   NO altera el balance (ingresos-gastos); es una vista informativa de cuánto se ha
-   movido a buen recaudo. Salida a interno = dinero apartado; entrada = dinero recuperado. */
-function ahorroApartadoMes(ym){
-  let apartado = 0;
-  for (const m of MOVS){
-    if (m.ym!==ym) continue;
+// Categorías de tipo 'interno' con datos en la serie (no fijamos solo ahorro/traspasos:
+// cualquier categoría interna con movimientos aparece)
+function categoriasInternoConDatos(serie){
+  const ids = new Set();
+  for (const ym of serie) for (const m of movsMes(ym)){
     const c = catById(m.categoriaId);
-    if (!c || c.tipo!=='interno') continue;
-    apartado += (-m.importe); // salida (importe<0) suma como apartado; entrada resta
+    if (c && c.tipo==='interno') ids.add(c.id);
   }
-  return r2(apartado);
+  return [...ids].map(id=>catById(id)).filter(Boolean);
 }
-function serieAhorroApartado(serie){
-  return serie.map(ym=>({ym, apartado: ahorroApartadoMes(ym)}));
+// serie mensual de sale/entra/neto para una categoría de flujo interno concreta
+function serieCategoriaInterno(catId, serie){
+  return serie.map(ym=>{
+    let sale=0, entra=0;
+    for (const m of movsMes(ym)){
+      if (m.categoriaId!==catId) continue;
+      if (m.importe<0) sale += -m.importe; else entra += m.importe;
+    }
+    return {ym, sale:r2(sale), entra:r2(entra), neto:r2(entra-sale)};
+  });
+}
+// Evolución mes a mes de los flujos internos, desglosada por categoría (ahorro, traspasos,
+// devoluciones...) y mostrando cuánto sale y cuánto vuelve en cada una, no solo el neto.
+function htmlFlujosEvolucion(){
+  const serie = serieMeses(anPeriodo>=999 ? meses().length : anPeriodo);
+  const cats = categoriasInternoConDatos(serie);
+  if (!cats.length) return '';
+  const ingPeriodo = r2(serie.reduce((s,ym)=>s+resumenMes(ym).ingReal,0));
+  const gasPeriodo = r2(serie.reduce((s,ym)=>s+resumenMes(ym).gasReal,0));
+  const icono = c => c.id==='ahorro'?'🏦':c.id==='traspasos'?'🔄':c.id==='devoluciones'?'↩️':'🔁';
+  const bloques = cats.map(c=>{
+    const datos = serieCategoriaInterno(c.id, serie);
+    const totalSale = r2(datos.reduce((s,x)=>s+x.sale,0));
+    const totalEntra = r2(datos.reduce((s,x)=>s+x.entra,0));
+    const totalNeto = r2(totalEntra-totalSale);
+    const max = Math.max(...datos.map(x=>Math.max(x.sale,x.entra)), 1);
+    return `<div style="margin-bottom:18px">
+      <div class="row" style="align-items:baseline;margin-bottom:6px">
+        <span class="micro"><strong>${icono(c)} ${esc(c.nombre)}</strong></span>
+        <span class="mono tiny">sale ${fmtEUR(totalSale)} · entra ${fmtEUR(totalEntra)} · <span class="${totalNeto>=0?'pos':'neg'}">neto ${totalNeto>=0?'+':''}${fmtEUR(totalNeto)}</span></span>
+      </div>
+      ${datos.map(x=>`<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+        <span class="tiny muted mono" style="width:38px">${nombreMesCorto(x.ym)}</span>
+        <div style="flex:1">${barraEntradaSalida(x.sale, x.entra, max)}</div>
+        <span class="tiny mono ${x.neto>=0?'pos':'neg'}" style="width:64px;text-align:right">${x.neto>=0?'+':''}${fmtEUR(x.neto)}</span>
+      </div>`).join('')}
+      <div class="catrow" onclick="verCategoria('${c.id}')" style="justify-content:flex-end;padding:4px 0 0"><span class="micro" style="color:var(--marca)">Ver movimientos ›</span></div>
+    </div>`;
+  }).join('');
+  return `<h2 class="seccion">Flujos internos · evolución 🔄</h2>
+    <div class="card">
+      <p class="micro muted" style="margin-top:0">Rojo = sale de tu bolsillo hacia otra cuenta propia; verde = vuelve. No afecta a tu balance: en este periodo tus ingresos reales fueron ${fmtEUR(ingPeriodo)} y tu gasto real ${fmtEUR(gasPeriodo)}.</p>
+      ${bloques}
+    </div>`;
 }
 
 
