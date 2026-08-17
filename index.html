@@ -873,6 +873,7 @@ function vResumen(){
       </div>`;
     }).join('')}
     ${htmlIngresos(R)}
+    ${htmlFlujosInternos(mesSel)}
   `;
 }
 // Comparativa sencilla: gasto de este mes vs el anterior, con una mini-tendencia de los últimos meses
@@ -930,6 +931,30 @@ function htmlIngresos(R){
       ${items.map(x=>`<div class="grupo" onclick="verCategoria('${x.cid==='__ingsc'?'__ingsc':x.cid}')">
         <div class="row"><span class="gnom"><span class="gic" style="background:var(--ingreso-bg)">${iconoIng(x.c)}</span>${esc(x.c?x.c.nombre:'Ingreso sin clasificar')}</span><span class="mono pos">${fmtEUR(x.v)}</span></div>
         <div class="barra"><div class="fill" style="width:${x.v/max*100}%;background:var(--ingreso)"></div></div>
+      </div>`).join('')}
+    </div>`;
+}
+// Desglose de los flujos internos del mes (ahorro, traspasos entre cuentas propias,
+// devoluciones): no son gasto ni ingreso real, pero conviene poder verlos y comprobar que
+// se han categorizado bien, con navegación directa a sus movimientos.
+function htmlFlujosInternos(ym){
+  const porCat = {};
+  for (const m of movsMes(ym)){
+    const c = catById(m.categoriaId);
+    if (!c || c.tipo!=='interno') continue;
+    porCat[c.id] = (porCat[c.id]||0) + m.importe;
+  }
+  const items = Object.entries(porCat).map(([cid,v])=>({cid, v:r2(v), c:catById(cid)}))
+    .sort((a,b)=>Math.abs(b.v)-Math.abs(a.v));
+  if (!items.length) return '';
+  const max = Math.max(...items.map(x=>Math.abs(x.v)), 1);
+  const icono = c => c ? (c.id==='ahorro'?'🏦':c.id==='traspasos'?'🔄':c.id==='devoluciones'?'↩️':'🔁') : '🔁';
+  return `<h2 class="seccion">Flujos internos <span class="tiny muted">(no cuentan como gasto)</span></h2>
+    <div class="card">
+      <p class="micro muted" style="margin-top:0">Ahorro y traspasos entre tus propias cuentas, y devoluciones de compra: mueven dinero pero no afectan a tu gasto ni ingreso real. Toca para ver los movimientos.</p>
+      ${items.map(x=>`<div class="grupo" onclick="verCategoria('${x.cid}')">
+        <div class="row"><span class="gnom"><span class="gic" style="background:var(--interno-bg)">${icono(x.c)}</span>${esc(x.c?x.c.nombre:'Sin clasificar')}</span><span class="mono int">${x.v>=0?'+':''}${fmtEUR(x.v)}</span></div>
+        <div class="barra"><div class="fill" style="width:${Math.abs(x.v)/max*100}%;background:var(--interno)"></div></div>
       </div>`).join('')}
     </div>`;
 }
