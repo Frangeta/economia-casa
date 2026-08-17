@@ -610,19 +610,20 @@ function recalcularPlanes(){
   const ventana = ms.slice(Math.max(0, idxUlt-12), idxUlt); // 12 meses cerrados anteriores al último
   const usar = ventana.length>=6 ? ventana : ms.slice(0, idxUlt).slice(-12); // fallback si hay poco histórico
   const base = usar.length ? usar : ms;
-  // acumula neto por categoría y mes (gasto = suma de -importe; ingreso = suma de +importe)
+  // acumula neto por categoría y mes (gasto/interno = suma de -importe, positivo si sale de
+  // la cuenta; ingreso = suma de +importe)
   const porCatMes = {};
   for (const m of MOVS){
     if (!base.includes(m.ym)) continue;
     const c = catById(m.categoriaId);
-    if (!c || (c.tipo!=='gasto' && c.tipo!=='ingreso')) continue;
+    if (!c || (c.tipo!=='gasto' && c.tipo!=='ingreso' && c.tipo!=='interno')) continue;
     (porCatMes[c.id] = porCatMes[c.id] || {});
     const signo = c.tipo==='ingreso' ? 1 : -1;
     porCatMes[c.id][m.ym] = (porCatMes[c.id][m.ym]||0) + (signo*m.importe);
   }
   let n=0;
   for (const c of CATS){
-    if (c.tipo!=='gasto' && c.tipo!=='ingreso') continue;
+    if (c.tipo!=='gasto' && c.tipo!=='ingreso' && c.tipo!=='interno') continue;
     const serie = base.map(ym => (porCatMes[c.id] && porCatMes[c.id][ym]) || 0);
     let val;
     if (c.metodoBase==='anualizado'){
@@ -1282,17 +1283,17 @@ function simReset(){ simRecortes = {}; render(); }
 function htmlRecurrentes(){
   const rec = detectarRecurrentes();
   if (!rec.length) return '';
-  const suben = rec.filter(r=>r.subidaPct>=8);
+  const suben = rec.filter(r=>r.hayComparacionAnual && r.subidaPct>=8);
   const iconoR = catId => { const c=catById(catId); return c?iconoGrupo(c.grupo):'🔁'; };
   const fila = r => {
-    const sube = r.subidaPct>=8, baja = r.subidaPct<=-8;
+    const sube = r.hayComparacionAnual && r.subidaPct>=8, baja = r.hayComparacionAnual && r.subidaPct<=-8;
     const col = sube?'var(--gasto)':baja?'var(--ingreso)':'var(--muted)';
     const flecha = sube?'↑':baja?'↓':'→';
     return `<div class="grupo" onclick="verRecurrente('${esc(r.claveRaw)}')">
       <div class="row"><span class="gnom"><span class="gic">${iconoR(r.catId)}</span>${esc(r.clave)}</span>
         <span class="mono">${fmtEUR(r.actual)}<span class="micro muted">/mes</span></span></div>
       <div class="tiny muted" style="margin-top:4px">${r.mesesN} meses · ${catById(r.catId)?.nombre||''}
-        ${(sube||baja)?`<span style="color:${col};font-weight:600;margin-left:4px">${flecha} ${r.subidaPct>=0?'+':''}${Math.round(r.subidaPct)}% desde ${r.primerYM.slice(0,4)}</span>`:''}</div>
+        ${(sube||baja)?`<span style="color:${col};font-weight:600;margin-left:4px">${flecha} ${r.subidaPct>=0?'+':''}${Math.round(r.subidaPct)}% vs hace un año</span>`:''}</div>
     </div>`;
   };
   return `<h2 class="seccion">Gastos recurrentes</h2>
@@ -1301,7 +1302,7 @@ function htmlRecurrentes(){
         <div style="flex:1"><strong style="color:var(--gasto)">${suben.length} recibo${suben.length>1?'s han':' ha'} subido de precio</strong>
         <div class="tiny" style="color:var(--gasto);margin-top:2px">${suben.slice(0,3).map(r=>esc(r.clave)+' +'+Math.round(r.subidaPct)+'%').join(' · ')}${suben.length>3?'…':''}</div></div></div>
     </div>`:''}
-    <p class="micro muted" style="margin:0 4px 10px">Pagos que se repiten cada mes con importe estable (suscripciones, recibos, cuotas). La flecha compara el importe actual con el de cuando empezaron.</p>
+    <p class="micro muted" style="margin:0 4px 10px">Pagos que se repiten cada mes con importe estable (suscripciones, recibos, cuotas). La flecha compara el importe reciente con el de los mismos meses del año pasado (si hay al menos un año de historial).</p>
     <div class="card">${rec.map(fila).join('')}</div>`;
 }
 function verRecurrente(clave){ filtroCat=''; filtroTxt=clave; vista='movimientos'; render(); window.scrollTo(0,0); }
@@ -1335,6 +1336,11 @@ function limpiarNombreRec(clave){
 }
 // categorías que son "recibos de verdad" cuya subida importa vigilar
 const CATS_RECIBO = new Set(['suministros','telecom','seguros','suscripciones','comunidad','hipoteca','prestamo_coche','prestamos','educacion']);
+// mismo mes, un año antes ('2026-03' -> '2025-03')
+function ymHaceUnAnio(ym){
+  const [y,m] = ym.split('-').map(Number);
+  return (y-1)+'-'+String(m).padStart(2,'0');
+}
 function detectarRecurrentes(){
   const gastos = MOVS.filter(m=>m.importe<0);
   const grupos = {};
@@ -1358,21 +1364,30 @@ function detectarRecurrentes(){
     if (cv >= 0.30) continue;
     const cats = {}; g.movs.forEach(m=>{ if(m.categoriaId) cats[m.categoriaId]=(cats[m.categoriaId]||0)+1; });
     const catId = Object.entries(cats).sort((a,b)=>b[1]-a[1])[0]?.[0] || null;
-    const nComp = Math.min(6, Math.floor(vals.length/2));
-    const prim = vals.slice(0,nComp), ult = vals.slice(-nComp);
-    const mp = prim.reduce((a,b)=>a+b,0)/prim.length, mu = ult.reduce((a,b)=>a+b,0)/ult.length;
-    const subidaPct = mp>0 ? (mu-mp)/mp*100 : 0;
+    // "actual": media de los últimos meses (hasta 3) — precio reciente
+    const nRecientes = Math.min(3, meses.length);
+    const recientesYM = meses.slice(-nRecientes);
+    const mu = recientesYM.reduce((s,ym)=>s+byMes[ym],0)/nRecientes;
+    // comparación interanual: los mismos meses pero un año antes, NO desde el inicio del
+    // histórico (comparar contra 2023 no tiene sentido si estamos en 2026). Si no hay al
+    // menos la mitad de esos meses un año antes, no se muestra comparación.
+    const anteriorYM = recientesYM.map(ymHaceUnAnio).filter(ym=>byMes[ym]!=null);
+    let subidaPct = 0, hayComparacionAnual = false;
+    if (anteriorYM.length >= Math.max(2, Math.ceil(nRecientes/2))){
+      const mp = anteriorYM.reduce((s,ym)=>s+byMes[ym],0)/anteriorYM.length;
+      if (mp>0){ subidaPct = (mu-mp)/mp*100; hayComparacionAnual = true; }
+    }
     rec.push({
       clave: limpiarNombreRec(g.clave), claveRaw: g.clave.toLowerCase(), catId, media, cv, mesesN: meses.length,
-      actual: mu, inicial: mp, subidaPct, primerYM: meses[0], ultimoYM: meses[meses.length-1],
+      actual: mu, subidaPct, hayComparacionAnual, primerYM: meses[0], ultimoYM: meses[meses.length-1],
       esRecibo: CATS_RECIBO.has(catId)
     });
   }
-  rec.sort((a,b)=> (b.subidaPct>=8&&b.esRecibo?1:0)-(a.subidaPct>=8&&a.esRecibo?1:0) || b.media-a.media);
+  rec.sort((a,b)=> (b.hayComparacionAnual&&b.subidaPct>=8&&b.esRecibo?1:0)-(a.hayComparacionAnual&&a.subidaPct>=8&&a.esRecibo?1:0) || b.media-a.media);
   return rec;
 }
 // para el aviso destacado solo cuentan recibos de verdad que suben (no restauración puntual)
-function recurrentesConSubida(){ return detectarRecurrentes().filter(r=>r.subidaPct>=8 && r.esRecibo); }
+function recurrentesConSubida(){ return detectarRecurrentes().filter(r=>r.hayComparacionAnual && r.subidaPct>=8 && r.esRecibo); }
 
 /* Detección de gastos anómalos: importes muy por encima de lo normal en su categoría.
    Excluye flujos internos y traspasos/Bizums a uno mismo (no son gasto real). */
@@ -1539,18 +1554,24 @@ function pintarGraficas(){
 
 function vPresupuesto(){
   // asegura que hay planCalc (gastos e ingresos); si nunca se ha calculado y hay datos, calcula
-  const faltaCalc = CATS.some(c=>(c.tipo==='gasto'||c.tipo==='ingreso') && c.planCalc==null);
+  const faltaCalc = CATS.some(c=>(c.tipo==='gasto'||c.tipo==='ingreso'||c.tipo==='interno') && c.planCalc==null);
   if (faltaCalc && MOVS.length){ recalcularPlanes(); guardarConfig(); }
 
   const modoMes = presuMes;               // null = presupuesto base; 'YYYY-MM' = override de ese mes
   const gastoCats = CATS.filter(c=>c.tipo==='gasto');
   const ingCats = CATS.filter(c=>c.tipo==='ingreso');
+  const internoCats = CATS.filter(c=>c.tipo==='interno');
   const grupos = [...new Set(gastoCats.map(c=>c.grupo))];
   let totCalc=0, totEfect=0, nAjustes=0;
   for (const c of gastoCats){ totCalc += (c.planCalc||0); totEfect += planEfectivo(c,modoMes); if(modoMes?tieneOverride(c.id,modoMes):c.planManual!=null) nAjustes++; }
   const dif = totEfect - totCalc;
   const ingEfect = ingCats.reduce((s,c)=>s+planEfectivo(c,modoMes),0);
   const balancePrev = ingEfect - totEfect;
+  // flujo interno previsto (positivo = sale de la cuenta hacia ahorro/otras cuentas propias)
+  let totInternoEfect=0, nAjustesInterno=0;
+  for (const c of internoCats){ totInternoEfect += planEfectivo(c,modoMes); if(modoMes?tieneOverride(c.id,modoMes):c.planManual!=null) nAjustesInterno++; }
+  const salidaTotal = r2(totEfect + totInternoEfect);      // todo lo que sale de la cuenta: gasto + traspasos
+  const disponible = r2(ingEfect - totEfect - totInternoEfect); // lo que te queda tras gasto Y traspasos
 
   const filaCat = c => {
     if (modoMes){
@@ -1621,9 +1642,24 @@ function vPresupuesto(){
         ${cats.map(filaCat).join('')}
       </div>`;
     }).join('')}
+
+    ${internoCats.length?`<h2 class="seccion">Traspasos a tus cuentas <span class="tiny muted">(no es gasto, pero sale de la cuenta)</span></h2>
+    <div class="card" style="padding:12px 14px">
+      <p class="micro muted" style="margin-top:0">Cuánto planeas mover a ahorro u otras cuentas propias. Se calcula igual que el resto (mediana de los últimos 12 meses) y puedes ajustarlo aquí abajo para ver cómo cambia lo que te queda disponible si traspasas más o menos.${nAjustesInterno?` <strong>${nAjustesInterno} ajuste${nAjustesInterno>1?'s':''}${modoMes?' este mes':''}.</strong>`:''}</p>
+      ${internoCats.map(filaCat).join('')}
+      <div class="row" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+        <span class="micro muted">Total que sale de la cuenta <span class="tiny">(gasto + traspasos)</span></span>
+        <span class="mono neg">${fmtEUR(salidaTotal)}</span>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <span class="micro"><strong>Lo que te queda</strong></span>
+        <span class="mono" style="font-weight:600;color:${disponible>=0?'var(--ingreso)':'var(--gasto)'}">${fmtEUR(disponible)}</span>
+      </div>
+    </div>`:''}
+
     ${!modoMes?`<div class="card" style="padding:12px 14px">
       <button class="btn sec" onclick="recalcularYGuardar()">Recalcular desde el histórico</button>
-      <p class="tiny muted" style="margin:8px 0 0">Actualiza el plan calculado con los movimientos más recientes. No toca tus ajustes a mano.</p>
+      <p class="tiny muted" style="margin:8px 0 0">Actualiza el plan calculado (gastos, ingresos y traspasos) con los movimientos más recientes. No toca tus ajustes a mano.</p>
     </div>`:''}`;
 }
 function nombreMesLargo(ym){ const [y,m]=ym.split('-'); return MESES[+m-1].charAt(0).toUpperCase()+MESES[+m-1].slice(1)+' '+y; }
