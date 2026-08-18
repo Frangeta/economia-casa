@@ -841,6 +841,7 @@ function vResumen(){
       <div class="kpi"><div class="ic" style="background:var(--gasto-bg)"><svg style="stroke:var(--gasto)" viewBox="0 0 24 24"><path d="M12 5v14M5 12l7 7 7-7"/></svg></div><div class="lbl">Gasto real</div><div class="val neg">${fmtEUR(R.gasReal)}</div></div>
       <div class="kpi"><div class="ic" style="background:var(--marca-bg)"><svg style="stroke:var(--marca)" viewBox="0 0 24 24"><path d="M3 12h18M12 3v18"/></svg></div><div class="lbl">Balance</div><div class="val" style="color:var(--marca)">${fmtEUR(balance)}</div><div class="sub">${tasa!=null?tasa+'% de ahorro':''}</div></div>
     </div>
+    ${htmlSaldoCuenta(R, balance)}
     ${htmlComparativaGasto(mesSel)}
     ${htmlPrevision(mesSel)}
     ${htmlAvisos(mesSel)}
@@ -876,6 +877,21 @@ function vResumen(){
     ${htmlIngresos(R)}
     ${htmlFlujosInternos(mesSel)}
   `;
+}
+// El Balance (ingresos - gasto real) es cuánto has ahorrado de verdad este mes: si traspasas
+// parte a otra cuenta propia, sigue siendo tuyo, así que no debe restar del Balance. PERO ese
+// dinero sí ha salido físicamente de la cuenta corriente, así que aquí se muestra por separado
+// cuánto ha cambiado realmente esa cuenta (Balance menos lo traspasado neto).
+function htmlSaldoCuenta(R, balance){
+  const netoInterno = r2(R.intOut - R.intIn); // positivo = ha salido más de lo que ha vuelto
+  if (Math.abs(netoInterno) < 1) return '';
+  const saldoCuenta = r2(balance - netoInterno);
+  return `<div class="card" style="padding:12px 14px">
+    <div class="row"><span class="micro muted">Balance (ingresos − gasto real)</span><span class="mono" style="color:var(--marca)">${fmtEUR(balance)}</span></div>
+    <div class="row" style="margin-top:4px"><span class="micro muted">${netoInterno>=0?'− traspasado':'+ recuperado'} a otras cuentas propias</span><span class="mono ${netoInterno>=0?'neg':'pos'}">${netoInterno>=0?'-':'+'}${fmtEUR(Math.abs(netoInterno))}</span></div>
+    <div class="row" style="margin-top:6px;padding-top:8px;border-top:1px solid var(--line)"><span class="micro"><strong>Cambio real en tu cuenta corriente</strong></span><span class="mono" style="font-weight:600;color:${saldoCuenta>=0?'var(--ingreso)':'var(--gasto)'}">${fmtEUR(saldoCuenta)}</span></div>
+    <p class="tiny muted" style="margin:8px 0 0">El Balance sigue siendo dinero tuyo (has ahorrado igual), pero parte ya no está en esta cuenta: se ha movido a ahorro/otra cuenta. Esto de aquí es lo que de verdad ha cambiado el saldo de la cuenta de la que salen tus gastos.</p>
+  </div>`;
 }
 // Comparativa sencilla: gasto de este mes vs el anterior, con una mini-tendencia de los últimos meses
 function htmlComparativaGasto(ym){
