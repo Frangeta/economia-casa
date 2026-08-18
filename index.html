@@ -224,7 +224,14 @@ function movId(fecha, importe, saldo){
   return fecha+'|'+importe.toFixed(2)+'|'+(saldo==null?'x':saldo.toFixed(2));
 }
 /* dos movimientos reales pueden compartir fecha+importe+saldo (p.ej. dos compras idénticas
-   el mismo día); se discrimina con un sufijo estable según el orden dentro del extracto */
+   el mismo día); se discrimina con un sufijo estable según el orden dentro del extracto.
+   LIMITACIÓN CONOCIDA: el contador se reinicia en cada fichero importado. Si subes dos
+   extractos solapados del mismo periodo y el banco los exporta en orden distinto (p.ej.
+   ascendente en uno, descendente en otro), el mismo movimiento real podría recibir un sufijo
+   distinto en cada import, y el emparejamiento de duplicados fallaría para ese caso concreto.
+   Poco probable (requiere fecha+importe+saldo iguales Y orden distinto entre imports), pero
+   posible: si alguna vez ves un duplicado o un "enriquecido" que no cuadra, es la primera
+   sospecha a revisar. */
 function idUnico(base, vistos){
   const n = (vistos.get(base)||0)+1; vistos.set(base,n);
   return n===1 ? base : base+'#'+n;
@@ -394,6 +401,12 @@ function claveValida(k, R){
 <script>
 /* ============ ESTADO Y PERSISTENCIA ============ */
 let DB=null, MOVS=[], CATS=[], REGLAS=null, META=null;
+// índice por id de MOVS, para no hacer MOVS.find(x=>x.id===id) (lineal) en cada apertura de
+// un movimiento. Se reconstruye entero solo cuando MOVS se reemplaza de golpe (carga inicial,
+// import); se actualiza incrementalmente en escucharMovimientos() cuando llegan cambios sueltos.
+let MOVS_IDX = new Map();
+function reindexMovs(){ MOVS_IDX = new Map(MOVS.map(m=>[m.id,m])); }
+const movById = id => MOVS_IDX.get(id);
 let vista='resumen', mesSel=null, grupoAbierto=null, filtroCat='', filtroTxt='', presuMes=null;
 
 /* ---- Firebase ---- */
@@ -453,6 +466,13 @@ function cachePut(movs){
     tx.oncomplete=res; tx.onerror=()=>rej(tx.error);
   });
 }
+function cacheDelete(ids){
+  return new Promise((res,rej)=>{
+    const tx = DB.transaction('mov','readwrite'); const st = tx.objectStore('mov');
+    for (const id of ids) st.delete(id);
+    tx.oncomplete=res; tx.onerror=()=>rej(tx.error);
+  });
+}
 function cacheClear(){
   return new Promise((res,rej)=>{
     const tx=DB.transaction('mov','readwrite'); tx.objectStore('mov').clear();
@@ -463,12 +483,17 @@ function cacheClear(){
 /* Adaptador: escribe en Firestore (batch por lotes) y refleja en la caché local */
 async function dbPutAll(movs){
   if (!movs.length) return;
-  await cachePut(movs);
-  const col = FS.collection('movimientos');
-  for (let i=0;i<movs.length;i+=400){
-    const batch = FS.batch();
-    for (const m of movs.slice(i,i+400)) batch.set(col.doc(fsId(m.id)), m);
-    await batch.commit();
+  await cachePut(movs); // la caché local se actualiza siempre, aunque falle la nube
+  try {
+    const col = FS.collection('movimientos');
+    for (let i=0;i<movs.length;i+=400){
+      const batch = FS.batch();
+      for (const m of movs.slice(i,i+400)) batch.set(col.doc(fsId(m.id)), m);
+      await batch.commit();
+    }
+  } catch(e){
+    console.error('dbPutAll: fallo escribiendo movimientos en Firestore', e);
+    if (navigator.onLine) bannerSync('No se ha podido guardar en la nube. Tus cambios quedan solo en este dispositivo — revisa la consola o vuelve a intentarlo.');
   }
 }
 async function dbGetAll(){ return await cacheGetAll(); }  // se lee de caché; Firestore sincroniza aparte
@@ -492,9 +517,23 @@ function renderDebounced(){ clearTimeout(renderPend); renderPend=setTimeout(()=>
 function escucharMovimientos(){
   if (escuchaMovs) escuchaMovs();
   escuchaMovs = FS.collection('movimientos').onSnapshot(snap=>{
-    MOVS = snap.docs.map(d=>d.data());
-    // refresca la caché local para que el próximo arranque sin conexión esté al día
-    cacheClear().then(()=>{ if(MOVS.length) cachePut(MOVS); });
+    // aplica solo lo que ha cambiado (altas/modificaciones/bajas), no recarga todo el histórico.
+    // En el primer snapshot, Firestore entrega TODOS los documentos como 'added': se comporta
+    // igual que antes para la carga inicial, pero un cambio suelto posterior ya no repite ese
+    // trabajo sobre miles de movimientos que no han cambiado.
+    const cambios = snap.docChanges();
+    const tocados = [], borrados = [];
+    for (const ch of cambios){
+      const d = ch.doc.data();
+      if (ch.type==='removed'){ MOVS_IDX.delete(d.id); borrados.push(d.id); }
+      else { MOVS_IDX.set(d.id, d); tocados.push(d); }
+    }
+    MOVS = [...MOVS_IDX.values()];
+    // refleja en la caché local solo lo tocado (antes: borraba y reescribía todo en cada cambio)
+    Promise.resolve()
+      .then(()=> tocados.length ? cachePut(tocados) : null)
+      .then(()=> borrados.length ? cacheDelete(borrados) : null)
+      .catch(e=>console.error('escucharMovimientos: fallo actualizando caché local', e));
     actualizarEstadoRed();
     if (!primerSnapshot || !importando) renderDebounced();
     primerSnapshot=false;
@@ -536,7 +575,7 @@ async function cargarConfig(){
     if (c.exists) cfgCat = c.data().v;
     if (r.exists) cfgReg = r.data().v;
     if (m.exists) cfgMeta = m.data().v;
-  } catch(e){ /* offline: se cae a valores locales/semilla */ }
+  } catch(e){ console.error('cargarConfig: fallo leyendo Firestore (se usa caché local/semilla)', e); }
 
   CATS = cfgCat || JSON.parse(localStorage.getItem(LS.cats)||'null') || SEED.categorias.map(c=>({...c}));
   REGLAS = cfgReg || JSON.parse(localStorage.getItem(LS.reglas)||'null') || JSON.parse(JSON.stringify(SEED.reglas));
@@ -582,7 +621,13 @@ async function guardarConfig(){
       FS.doc('config/reglas').set({v:REGLAS}),
       FS.doc('config/meta').set({v:META})
     ]);
-  } catch(e){ /* offline: quedará en local y subirá al reconectar vía próxima escritura */ }
+  } catch(e){
+    console.error('guardarConfig: fallo escribiendo en Firestore', e);
+    // si el navegador se cree online y aun así falla, no es un simple "estoy offline":
+    // puede ser una regla de Firestore rechazando la escritura o un documento demasiado
+    // grande (p.ej. REGLAS.comercios acercándose al límite de 1MB por documento)
+    if (navigator.onLine) bannerSync('No se ha podido guardar en la nube. Tus cambios quedan solo en este dispositivo — revisa la consola o vuelve a intentarlo.');
+  }
 }
 
 function flujoDe(catId){ const c=catById(catId); return c && c.tipo==='interno' ? 'interno' : 'real'; }
@@ -722,7 +767,7 @@ async function importarFichero(file){
       aGuardar.push(ex); enriquecidos++;
     } else dups++;
   }
-  if (aGuardar.length){ await dbPutAll(aGuardar); MOVS=[...porId.values()]; }
+  if (aGuardar.length){ await dbPutAll(aGuardar); MOVS_IDX = porId; MOVS=[...porId.values()]; }
   if (parsed.cuenta && !META.cuenta){ META.cuenta=parsed.cuenta; }
   META.ultimaImportacion=new Date().toISOString(); await guardarConfig();
   const sinCat = parsed.movs.filter(m=>porId.get(m.id).categoriaId===null).length;
@@ -787,6 +832,9 @@ const ICON_GRUPO = {
   'Efectivo':'💶','Otros':'📦','Sin clasificar':'❓','Flujos internos':'🔄','Ingresos':'💼'
 };
 const iconoGrupo = g => ICON_GRUPO[g] || '📦';
+// icono por categoría de flujo interno (ahorro/traspasos/devoluciones), compartido entre
+// el desglose del Resumen y la evolución de Análisis
+const iconoInterno = c => c ? (c.id==='ahorro'?'🏦':c.id==='traspasos'?'🔄':c.id==='devoluciones'?'↩️':'🔁') : '🔁';
 
 const ICONS = {
   resumen:'<svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>',
@@ -844,7 +892,7 @@ function vResumen(){
 
   // cinta: destino de los ingresos del mes (gasto + traspasos + lo que queda de balance)
   const total = Math.max(R.ingReal, R.gasReal + Math.max(netoInterno,0) + Math.max(balance,0), 1);
-  const wGas = R.gasReal/total*100, wTra = Math.max(netoInterno,0)/total*100, wBal = Math.max(balance,0)/total*100;
+  const wTra = Math.max(netoInterno,0)/total*100, wBal = Math.max(balance,0)/total*100;
   const grupos = Object.entries(R.porGrupo).sort((a,b)=>b[1]-a[1]);
   const paleta = ['#A6432D','#C0623F','#CE8155','#D99E72','#E2B891','#EAD1B4','#D6C8A8','#BFB89A'];
   let ci=0;
@@ -989,13 +1037,12 @@ function htmlFlujosInternos(ym){
     .sort((a,b)=>Math.max(b.sale,b.entra)-Math.max(a.sale,a.entra));
   if (!items.length) return '';
   const max = Math.max(...items.map(x=>Math.max(x.sale,x.entra)), 1);
-  const icono = c => c ? (c.id==='ahorro'?'🏦':c.id==='traspasos'?'🔄':c.id==='devoluciones'?'↩️':'🔁') : '🔁';
   const R = resumenMes(ym);
   return `<h2 class="seccion">Flujos internos <span class="tiny muted">(no cuentan como gasto)</span></h2>
     <div class="card">
       <p class="micro muted" style="margin-top:0">Ahorro y traspasos entre tus propias cuentas, y devoluciones de compra: no son gasto ni ingreso real (este mes: ingresos ${fmtEUR(R.ingReal)}, gasto ${fmtEUR(R.gasReal)}), pero sí están descontados del Balance, porque esta cuenta se queda sin ese dinero. Toca una categoría para ver sus movimientos.</p>
       ${items.map(x=>`<div class="grupo" onclick="verCategoria('${x.cid}')">
-        <div class="row"><span class="gnom"><span class="gic" style="background:var(--interno-bg)">${icono(x.c)}</span>${esc(x.c?x.c.nombre:'Sin clasificar')}</span><span class="mono int">${x.neto>=0?'+':''}${fmtEUR(x.neto)}</span></div>
+        <div class="row"><span class="gnom"><span class="gic" style="background:var(--interno-bg)">${iconoInterno(x.c)}</span>${esc(x.c?x.c.nombre:'Sin clasificar')}</span><span class="mono int">${x.neto>=0?'+':''}${fmtEUR(x.neto)}</span></div>
         ${barraEntradaSalida(x.sale, x.entra, max)}
         <div class="tiny muted" style="margin-top:4px">sale ${fmtEUR(x.sale)} · entra ${fmtEUR(x.entra)}</div>
       </div>`).join('')}
@@ -1006,7 +1053,7 @@ function togglePrevision(){ previsionAbierta = !previsionAbierta; render(); }
 // aviso compacto en el Resumen si hay recibos que han subido de precio
 let avisosAbierto = false;
 function verMovId(id){
-  const m = MOVS.find(x=>x.id===id); if(!m) return;
+  const m = movById(id); if(!m) return;
   filtroCat=''; filtroTxt = conceptoDe(m).clave.toLowerCase(); vista='movimientos'; render(); window.scrollTo(0,0);
 }
 function toggleAvisos(){ avisosAbierto = !avisosAbierto; render(); }
@@ -1027,7 +1074,7 @@ function htmlAvisos(ym){
     </div>
     ${avisosAbierto?`<div class="avisos-cuerpo">
       ${suben.length?`<div class="aviso-grupo"><div class="aviso-tit">📈 Recibos que han subido</div>
-        ${suben.slice(0,5).map(r=>`<div class="catrow" onclick="verRecurrente('${esc(r.claveRaw)}')"><span>${esc(r.clave)}</span><span class="mono neg">+${Math.round(r.subidaPct)}% · ${fmtEUR(r.actual)}</span></div>`).join('')}
+        ${suben.slice(0,5).map(r=>`<div class="catrow" data-clave="${esc(r.claveRaw)}" onclick="verRecurrente(this.dataset.clave)"><span>${esc(r.clave)}</span><span class="mono neg">+${Math.round(r.subidaPct)}% · ${fmtEUR(r.actual)}</span></div>`).join('')}
         <div class="tiny muted" style="padding:4px 6px">Ver todos en Análisis › Gastos recurrentes</div></div>`:''}
       ${anom.length?`<div class="aviso-grupo"><div class="aviso-tit">👀 Gastos altos este mes</div>
         ${anom.slice(0,5).map(a=>`<div class="catrow" onclick="verMovId('${a.id}')"><span>${esc(a.concepto)} <span class="tiny muted">${a.veces}×</span></span><span class="mono neg">${fmtEUR(a.importe)}</span></div>`).join('')}</div>`:''}
@@ -1327,7 +1374,7 @@ function htmlRecurrentes(){
     const sube = r.hayComparacionAnual && r.subidaPct>=8, baja = r.hayComparacionAnual && r.subidaPct<=-8;
     const col = sube?'var(--gasto)':baja?'var(--ingreso)':'var(--muted)';
     const flecha = sube?'↑':baja?'↓':'→';
-    return `<div class="grupo" onclick="verRecurrente('${esc(r.claveRaw)}')">
+    return `<div class="grupo" data-clave="${esc(r.claveRaw)}" onclick="verRecurrente(this.dataset.clave)">
       <div class="row"><span class="gnom"><span class="gic">${iconoR(r.catId)}</span>${esc(r.clave)}</span>
         <span class="mono">${fmtEUR(r.actual)}<span class="micro muted">/mes</span></span></div>
       <div class="tiny muted" style="margin-top:4px">${r.mesesN} meses · ${catById(r.catId)?.nombre||''}
@@ -1380,7 +1427,11 @@ function ymHaceUnAnio(ym){
   return (y-1)+'-'+String(m).padStart(2,'0');
 }
 function detectarRecurrentes(){
-  const gastos = MOVS.filter(m=>m.importe<0);
+  // Se acota a los últimos 24 meses cerrados: de sobra para detectar recurrencia (mínimo 6
+  // meses) y para la comparación interanual (necesita ~13), sin recorrer un histórico que solo
+  // crece con los años en cada render del Resumen.
+  const ventana = new Set(serieMeses(24));
+  const gastos = MOVS.filter(m=>m.importe<0 && ventana.has(m.ym));
   const grupos = {};
   for (const m of gastos){
     const con = conceptoDe(m);
@@ -1430,9 +1481,13 @@ function recurrentesConSubida(){ return detectarRecurrentes().filter(r=>r.hayCom
 /* Detección de gastos anómalos: importes muy por encima de lo normal en su categoría.
    Excluye flujos internos y traspasos/Bizums a uno mismo (no son gasto real). */
 function detectarAnomalos(mesFiltro){
-  // estadísticas por categoría de gasto sobre todo el histórico
+  // estadísticas por categoría de gasto: acotadas a los últimos 36 meses cerrados (margen de
+  // sobra para una base estadística estable por categoría) en vez de todo el histórico, que
+  // solo crece con los años.
+  const ventana = new Set(serieMeses(36));
+  const movsVentana = MOVS.filter(m=>ventana.has(m.ym));
   const porCat = {};
-  for (const m of MOVS){
+  for (const m of movsVentana){
     if (m.importe>=0 || !m.categoriaId) continue;
     const c = catById(m.categoriaId);
     if (!c || c.tipo!=='gasto') continue;              // solo gasto real (excluye internos/ingresos)
@@ -1445,9 +1500,9 @@ function detectarAnomalos(mesFiltro){
     const sd = Math.sqrt(arr.reduce((s,x)=>s+(x-media)**2,0)/arr.length);
     stats[cid] = {media, sd, n:arr.length};
   }
-  const propios = new Set([...(REGLAS.nombresPropios||[])].map(s=>s.toLowerCase()));
+  const propiosArr = [...new Set([...(REGLAS.nombresPropios||[])].map(s=>s.toLowerCase()))];
   const anom = [];
-  for (const m of MOVS){
+  for (const m of movsVentana){
     if (m.importe>=0 || !m.categoriaId) continue;
     if (mesFiltro && m.ym!==mesFiltro) continue;
     const c = catById(m.categoriaId);
@@ -1456,7 +1511,7 @@ function detectarAnomalos(mesFiltro){
     const con = conceptoDe(m);
     const claveL = con.clave.toLowerCase();
     const desc = (m.descripcion||'').toLowerCase();
-    const esPropio = [...propios].some(p=>p && (claveL.includes(p) || desc.includes(p)));
+    const esPropio = propiosArr.some(p=>p && (claveL.includes(p) || desc.includes(p)));
     const esTraspaso = /traspaso/.test(desc);
     if (esPropio || esTraspaso) continue;
     const s = stats[m.categoriaId];
@@ -1502,7 +1557,6 @@ function htmlFlujosEvolucion(){
   if (!cats.length) return '';
   const ingPeriodo = r2(serie.reduce((s,ym)=>s+resumenMes(ym).ingReal,0));
   const gasPeriodo = r2(serie.reduce((s,ym)=>s+resumenMes(ym).gasReal,0));
-  const icono = c => c.id==='ahorro'?'🏦':c.id==='traspasos'?'🔄':c.id==='devoluciones'?'↩️':'🔁';
   const bloques = cats.map(c=>{
     const datos = serieCategoriaInterno(c.id, serie);
     const totalSale = r2(datos.reduce((s,x)=>s+x.sale,0));
@@ -1511,7 +1565,7 @@ function htmlFlujosEvolucion(){
     const max = Math.max(...datos.map(x=>Math.max(x.sale,x.entra)), 1);
     return `<div style="margin-bottom:18px">
       <div class="row" style="align-items:baseline;margin-bottom:6px">
-        <span class="micro"><strong>${icono(c)} ${esc(c.nombre)}</strong></span>
+        <span class="micro"><strong>${iconoInterno(c)} ${esc(c.nombre)}</strong></span>
         <span class="mono tiny">sale ${fmtEUR(totalSale)} · entra ${fmtEUR(totalEntra)} · <span class="${totalNeto>=0?'pos':'neg'}">neto ${totalNeto>=0?'+':''}${fmtEUR(totalNeto)}</span></span>
       </div>
       ${datos.map(x=>`<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
@@ -1601,9 +1655,8 @@ function vPresupuesto(){
   const ingCats = CATS.filter(c=>c.tipo==='ingreso');
   const internoCats = CATS.filter(c=>c.tipo==='interno');
   const grupos = [...new Set(gastoCats.map(c=>c.grupo))];
-  let totCalc=0, totEfect=0, nAjustes=0;
-  for (const c of gastoCats){ totCalc += (c.planCalc||0); totEfect += planEfectivo(c,modoMes); if(modoMes?tieneOverride(c.id,modoMes):c.planManual!=null) nAjustes++; }
-  const dif = totEfect - totCalc;
+  let totEfect=0, nAjustes=0;
+  for (const c of gastoCats){ totEfect += planEfectivo(c,modoMes); if(modoMes?tieneOverride(c.id,modoMes):c.planManual!=null) nAjustes++; }
   const ingEfect = ingCats.reduce((s,c)=>s+planEfectivo(c,modoMes),0);
   // flujo interno previsto (positivo = sale de la cuenta hacia ahorro/otras cuentas propias)
   let totInternoEfect=0, nAjustesInterno=0;
@@ -1848,7 +1901,7 @@ function vBandejaLista(cabecera){
 const cssId = id => id.replace(/[^a-zA-Z0-9]/g,'_');
 
 async function asignarDesdeBandeja(id){
-  const m = MOVS.find(x=>x.id===id);
+  const m = movById(id);
   const sel = document.getElementById('sel-'+cssId(id));
   if (!m || !sel.value) return;
   m.categoriaId = sel.value; m.via='manual'; m.revisado=true; m.flujo=flujoDe(sel.value);
@@ -1865,7 +1918,7 @@ async function asignarDesdeBandeja(id){
   </div>` : `<div class="tiny muted" style="margin-top:6px">Asignado. (No se sugiere regla porque el concepto es demasiado genérico.)</div>`;
 }
 async function guardarRegla(id){
-  const m = MOVS.find(x=>x.id===id);
+  const m = movById(id);
   const inp = document.getElementById('clave-'+cssId(id));
   const v = claveValida(inp.value, REGLAS);
   if (!v.ok){ alert(v.motivo); return; }
@@ -2034,6 +2087,7 @@ async function restaurarBackup(files){
     if (!confirm(`La copia tiene ${data.movimientos.length} movimientos. Sustituirá todo lo actual. ¿Continuar?`)) return;
     await dbClear();
     MOVS = data.movimientos; CATS = data.categorias; REGLAS = data.reglas; META = data.meta||META;
+    reindexMovs();
     await dbPutAll(MOVS); guardarConfig(); render();
   }catch(err){ alert('No se pudo restaurar: '+err.message); }
 }
@@ -2041,7 +2095,7 @@ async function borrarTodo(){
   if (!confirm('Se borrarán todos los movimientos y reglas aprendidas. ¿Seguro?')) return;
   if (!confirm('Última confirmación: esta acción no se puede deshacer sin una copia de seguridad.')) return;
   await dbClear(); localStorage.removeItem(LS.cats); localStorage.removeItem(LS.reglas); localStorage.removeItem(LS.meta);
-  MOVS=[]; cargarConfig(); render();
+  MOVS=[]; MOVS_IDX.clear(); cargarConfig(); render();
 }
 async function recategorizarTodo(){
   const afectados=[];
@@ -2053,7 +2107,7 @@ async function recategorizarTodo(){
 
 /* ============ HOJA DE EDICIÓN ============ */
 function abrirHoja(id){
-  const m = MOVS.find(x=>x.id===id); if(!m) return;
+  const m = movById(id); if(!m) return;
   const concepto = conceptoDe(m);
   const claveProp = (concepto.tipo==='persona'?concepto.clave:concepto.clave.slice(0,30)).toLowerCase().trim();
   const valida = claveValida(claveProp, REGLAS).ok;
@@ -2094,7 +2148,7 @@ function refrescarPropagar(){
   </div>`;
 }
 async function guardarHoja(id){
-  const m = MOVS.find(x=>x.id===id); if(!m) return;
+  const m = movById(id); if(!m) return;
   const cat = document.getElementById('h-cat').value || null;
   const catCambia = cat !== m.categoriaId;
   if (catCambia){ m.categoriaId=cat; m.via = cat?'manual':null; m.flujo = cat?flujoDe(cat):'real'; m.revisado=!!cat; }
@@ -2198,2224 +2252,7 @@ AUTH.onAuthStateChanged(async user => {
   try {
     DB = await abrirDB();
     await cargarConfig();
-    MOVS = await cacheGetAll();
-    render();                    // arranque instantáneo desde la caché local
-    if (seedActualizada && MOVS.length){
-      const afectados=[];
-      for (const m of MOVS){ if (m.via==='manual') continue; const antes=m.categoriaId; aplicarCategoria(m); if (m.categoriaId!==antes) afectados.push(m); }
-      if (afectados.length) await dbPutAll(afectados);
-    }
-    escucharMovimientos();       // sincronización en vivo con la nube (tiempo real)
-    escucharConfig();
-  } catch(e){
-    document.getElementById('main').innerHTML = `<div class="card"><strong>Error al iniciar.</strong><div class="tiny mono" style="color:var(--gasto);margin-top:6px">${esc(e.message)}</div></div>`;
-  }
-});
-// permite entrar con Enter desde la contraseña
-document.addEventListener('keydown', e=>{ if(e.key==='Enter' && document.getElementById('login').style.display!=='none') hacerLogin(); });
-</script>
-</body>
-</html><!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8">
-<title>Economía de casa</title>
-<meta name="theme-color" content="#5B6EE8">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="apple-mobile-web-app-title" content="Economía">
-<meta name="mobile-web-app-capable" content="yes">
-<!-- Icono embebido (casita + €) en SVG, sin fichero aparte -->
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%235B6EE8'/%3E%3Cpath d='M28 46 L50 28 L72 46 V72 H28 Z' fill='none' stroke='white' stroke-width='5' stroke-linejoin='round'/%3E%3Ctext x='50' y='66' font-size='26' font-family='Georgia,serif' fill='white' text-anchor='middle' font-weight='bold'%3E%E2%82%AC%3C/text%3E%3C/svg%3E">
-<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%235B6EE8'/%3E%3Cpath d='M28 46 L50 28 L72 46 V72 H28 Z' fill='none' stroke='white' stroke-width='5' stroke-linejoin='round'/%3E%3Ctext x='50' y='66' font-size='26' font-family='Georgia,serif' fill='white' text-anchor='middle' font-weight='bold'%3E%E2%82%AC%3C/text%3E%3C/svg%3E">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
-<style>
-:root{
-  --bg:#F7F8FC; --card:#FFFFFF; --ink:#1B1F2A; --muted:#7A8194; --line:#EAECF3;
-  --marca:#5B6EE8; --marca-bg:#EEF0FD;
-  --ingreso:#0FA47F; --ingreso-bg:#E3F5EF; --gasto:#E5654B; --gasto-bg:#FCEAE5;
-  --interno:#8A93A8; --interno-bg:#EFF1F6; --plan:#E0A32E; --plan-bg:#FBF2DD;
-  --ok:#0FA47F; --warn:#E0A32E; --bad:#E5654B;
-  --sombra:0 1px 3px rgba(27,31,42,.04), 0 6px 20px rgba(27,31,42,.05);
-}
-*{box-sizing:border-box} html,body{margin:0;padding:0}
-body{background:var(--bg);color:var(--ink);font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;line-height:1.45;font-size:15px}
-#app{max-width:680px;margin:0 auto;min-height:100vh;padding-bottom:90px}
-.mono{font-variant-numeric:tabular-nums;font-feature-settings:"tnum"}
-.serif{font-family:'Fraunces',Georgia,serif}
-header{padding:22px 16px 8px;display:flex;justify-content:space-between;align-items:flex-start}
-header h1{font-family:'Fraunces',Georgia,serif;font-size:22px;margin:0;font-weight:600;letter-spacing:-0.01em}
-header .saludo{font-size:13px;color:var(--muted);margin-top:2px}
-header .cuenta{font-size:11px;color:var(--muted);background:var(--card);padding:4px 10px;border-radius:20px;border:1px solid var(--line);white-space:nowrap}
-.muted{color:var(--muted)} .micro{font-size:12px} .tiny{font-size:11px}
-.pos{color:var(--ingreso)} .neg{color:var(--gasto)} .int{color:var(--interno)}
-main{padding:0 14px}
-.card{background:var(--card);border:none;border-radius:16px;padding:16px;margin-bottom:12px;box-shadow:var(--sombra)}
-.row{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
-.truncate{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-
-/* selector de mes */
-.mespicker{display:flex;align-items:center;justify-content:space-between;padding:8px 2px 14px}
-.mespicker button{background:var(--card);border:1px solid var(--line);border-radius:12px;width:38px;height:38px;font-size:17px;color:var(--ink);cursor:pointer;box-shadow:var(--sombra)}
-.mespicker button:disabled{opacity:0.3;box-shadow:none}
-.mespicker .mes{font-family:'Fraunces',serif;font-size:18px;font-weight:600;text-transform:capitalize}
-
-/* KPIs */
-.kpis{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px}
-.kpi{background:var(--card);border:none;border-radius:16px;padding:15px 13px 16px;box-shadow:var(--sombra)}
-.kpi .ic{width:32px;height:32px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:10px}
-.kpi .ic svg{width:17px;height:17px;stroke-width:2;fill:none;stroke-linecap:round;stroke-linejoin:round}
-.kpi .lbl{font-size:11px;color:var(--muted);margin-bottom:2px}
-.kpi .val{font-family:'Fraunces',serif;font-weight:600;font-size:20px;font-variant-numeric:tabular-nums;letter-spacing:-0.01em}
-.kpi .sub{font-size:11px;color:var(--muted);margin-top:1px}
-
-/* cinta del mes */
-.cinta{height:26px;border-radius:8px;overflow:hidden;display:flex;margin:8px 0 6px}
-.cinta>div{height:100%;min-width:2px}
-.leyenda{display:flex;flex-wrap:wrap;gap:10px;font-size:11px;color:var(--muted)}
-.leyenda .dot{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:4px;vertical-align:-1px}
-
-/* grupos */
-.grupo{padding:12px 2px;cursor:pointer;border-top:1px solid var(--line)}
-.grupo:first-of-type{border-top:none}
-.grupo .gnom{display:flex;align-items:center;gap:9px}
-.gic{width:28px;height:28px;border-radius:9px;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:15px;background:var(--marca-bg)}
-.grupo .barra{height:8px;background:var(--bg);border-radius:6px;margin-top:8px;overflow:hidden;position:relative}
-.grupo .barra .fill{height:100%;border-radius:6px;background:var(--interno)}
-.grupo .barra .marca{position:absolute;top:-2px;width:2px;height:12px;background:var(--plan)}
-.barra{height:8px;background:var(--bg);border-radius:6px;overflow:hidden;position:relative}
-.barra .fill{height:100%;border-radius:6px;background:var(--interno)}
-.catlist{margin-top:10px;border-top:1px solid var(--line);padding-top:6px}
-.catrow{display:flex;justify-content:space-between;padding:7px 6px;font-size:13px;cursor:pointer;border-radius:8px;align-items:center}
-.catrow:hover{background:var(--bg)}
-
-/* listas de movimientos */
-.mov{display:flex;gap:10px;padding:9px 4px;border-bottom:1px solid var(--line);align-items:baseline;cursor:pointer}
-.mov:last-child{border-bottom:none}
-.mov .fecha{font-size:11px;color:var(--muted);width:44px;flex-shrink:0}
-.mov .desc{flex:1;min-width:0}
-.mov .desc .cat{font-size:11px;color:var(--muted)}
-.mov .imp{font-variant-numeric:tabular-nums;font-size:14px;flex-shrink:0}
-.pill{display:inline-block;font-size:10px;padding:1px 7px;border-radius:9px;background:var(--interno-bg);color:var(--interno);vertical-align:1px}
-.pill.rev{background:var(--plan-bg);color:var(--plan)}
-
-/* formularios */
-input[type=text],input[type=search],input[type=email],input[type=password],select{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:12px;font-size:14px;background:var(--card);color:var(--ink);font-family:inherit}
-input:focus,select:focus,button:focus-visible{outline:2px solid var(--marca);outline-offset:1px}
-.btn{display:inline-block;background:var(--marca);color:#fff;border:none;border-radius:12px;padding:11px 18px;font-size:14px;font-weight:500;cursor:pointer;font-family:inherit}
-.btn.sec{background:var(--card);color:var(--ink);border:1px solid var(--line)}
-.btn.peligro{background:var(--gasto)}
-.btn:disabled{opacity:0.4;cursor:default}
-.filtros{display:flex;gap:8px;margin-bottom:10px}
-.filtros select{flex:1}
-
-/* import */
-.drop{border:2px dashed var(--line);border-radius:16px;padding:34px 16px;text-align:center;color:var(--muted);cursor:pointer;background:var(--card);box-shadow:var(--sombra)}
-.drop.over{border-color:var(--marca);color:var(--marca);background:var(--marca-bg)}
-.resultado td{padding:3px 12px 3px 0;font-size:14px}
-
-/* bandeja */
-.bandeja-item{padding:14px;border:none;border-radius:16px;margin-bottom:10px;background:var(--card);box-shadow:var(--sombra)}
-.bandeja-item .acciones{display:flex;gap:8px;margin-top:9px}
-.bandeja-item select{flex:1}
-.regla-box{margin-top:9px;padding:10px;background:var(--bg);border-radius:10px;display:flex;gap:8px;align-items:center}
-.regla-box input{flex:1}
-
-/* hoja de edición */
-#velo{position:fixed;inset:0;background:rgba(27,31,42,0.4);display:none;z-index:20}
-#hoja{position:fixed;left:0;right:0;bottom:0;background:var(--card);border-radius:22px 22px 0 0;padding:20px 18px 26px;display:none;z-index:21;max-width:680px;margin:0 auto;max-height:80vh;overflow-y:auto}
-#hoja h3{margin:0 0 4px;font-family:'Fraunces',serif;font-weight:600;font-size:17px}
-#hoja .campo{margin-top:12px}
-#hoja label{font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);display:block;margin-bottom:4px}
-
-/* nav inferior */
-nav{position:fixed;bottom:0;left:0;right:0;background:rgba(255,255,255,.92);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-top:1px solid var(--line);display:flex;max-width:680px;margin:0 auto;z-index:10;padding:6px 2px calc(8px + env(safe-area-inset-bottom))}
-nav button{flex:1;background:none;border:none;padding:4px 4px;font-size:10px;color:var(--muted);cursor:pointer;font-family:inherit;position:relative;white-space:nowrap;display:flex;flex-direction:column;align-items:center;gap:3px}
-nav button.on{color:var(--marca);font-weight:600}
-nav button .navic{width:42px;height:28px;border-radius:12px;display:flex;align-items:center;justify-content:center;transition:background .15s}
-nav button.on .navic{background:var(--marca-bg)}
-nav button .badge{position:absolute;top:-1px;right:calc(50% - 24px);background:var(--gasto);color:#fff;font-size:9px;border-radius:8px;padding:0 5px;min-width:15px;text-align:center}
-nav button svg{width:20px;height:20px;stroke:currentColor;stroke-width:1.9;fill:none;stroke-linecap:round;stroke-linejoin:round}
-.mas-lista{margin-top:8px}
-.mas-item{display:flex;align-items:center;gap:12px;width:100%;background:none;border:none;border-radius:12px;padding:14px 12px;font-size:15px;font-family:inherit;color:var(--ink);cursor:pointer;text-align:left}
-.mas-item:hover{background:var(--bg)}
-.mas-item .mas-ic{width:38px;height:38px;border-radius:11px;background:var(--marca-bg);display:flex;align-items:center;justify-content:center;flex-shrink:0}
-.mas-item .mas-ic svg{width:20px;height:20px;stroke:var(--marca);stroke-width:1.9;fill:none;stroke-linecap:round;stroke-linejoin:round}
-.mas-item>span:nth-child(2){flex:1}
-.mas-item .mas-fl{color:var(--muted);font-size:18px}
-
-.vacio{text-align:center;color:var(--muted);padding:36px 16px;font-size:14px}
-h2.seccion{font-family:'Fraunces',serif;font-weight:600;font-size:16px;margin:18px 4px 10px;letter-spacing:-0.01em}
-
-/* barras previsión vs real */
-.pbar{position:relative;height:12px;background:var(--bg);border-radius:6px;margin-top:6px;overflow:visible;border:1px solid var(--line)}
-.pbar-fill{position:absolute;left:0;top:0;height:100%;border-radius:6px;min-width:3px}
-.pbar-prev{position:absolute;top:-3px;width:3px;height:18px;background:var(--ink);border-radius:2px;transform:translateX(-50%);box-shadow:0 0 0 1.5px var(--card)}
-.pbar-ritmo{position:absolute;top:-1px;width:2px;height:14px;background:var(--muted);transform:translateX(-50%);opacity:0.7}
-.pbar-bal .pbar-fill{left:auto}
-.pbar-cero{position:absolute;left:50%;top:-3px;width:1px;height:18px;background:var(--muted);transform:translateX(-50%);opacity:0.5}
-
-/* presupuesto */
-.presu-row{display:grid;grid-template-columns:1fr auto 88px 22px;align-items:center;gap:8px;padding:6px 0;border-top:1px solid var(--line)}.presu-row:first-of-type{border-top:none}
-.presu-nom{font-size:13px}
-.presu-input input{width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;text-align:right;font-variant-numeric:tabular-nums;font-family:inherit}
-.presu-input input.ajustado{border-color:var(--plan);background:var(--plan-bg);font-weight:600;color:var(--plan)}
-.presu-x{background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer;width:22px;text-align:center;padding:0}
-
-/* slider simulador */
-input[type=range]{-webkit-appearance:none;appearance:none;height:6px;background:var(--line);border-radius:3px;outline:none}
-input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:var(--marca);cursor:pointer;border:2px solid var(--card);box-shadow:var(--sombra)}
-input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:var(--marca);cursor:pointer;border:2px solid var(--card)}
-
-/* avisos unificados */
-.avisos{background:var(--card);border-radius:14px;margin-bottom:12px;box-shadow:var(--sombra);overflow:hidden}
-.avisos-cab{display:flex;align-items:center;justify-content:space-between;padding:13px 15px;cursor:pointer}
-.avisos-izq{display:flex;align-items:center;gap:8px;font-size:14px}
-.avisos-punto{width:8px;height:8px;border-radius:50%;background:var(--plan);flex-shrink:0;box-shadow:0 0 0 3px var(--plan-bg)}
-.avisos-fl{color:var(--muted);font-size:11px}
-.avisos-cuerpo{padding:0 15px 8px}
-.aviso-grupo{border-top:1px solid var(--line);padding-top:8px;margin-top:4px}
-.aviso-tit{font-size:12px;color:var(--muted);margin-bottom:2px;padding:0 6px}
-
-/* login */
-#login .box{background:var(--card);border:none;border-radius:20px;padding:30px 26px;max-width:360px;width:100%;box-shadow:var(--sombra)}
-#login h1{font-family:'Fraunces',serif;font-weight:600;font-size:24px;margin:0 0 4px;display:flex;align-items:center;gap:8px;letter-spacing:-0.01em}
-#login p{color:var(--muted);font-size:13px;margin:0 0 20px}
-#login .campo{margin-bottom:12px}
-#login label{font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);display:block;margin-bottom:5px}
-#login input{width:100%;padding:12px 13px;border:1px solid var(--line);border-radius:12px;font-size:15px;font-family:inherit;background:var(--bg)}
-#login .btn{width:100%;margin-top:6px;padding:13px}
-#login .err{color:var(--gasto);font-size:13px;margin-top:12px;min-height:18px}
-#sync{position:fixed;top:0;left:0;right:0;background:var(--plan);color:#fff;text-align:center;font-size:12px;padding:5px;z-index:40;display:none}
-#topbar h1{font-family:'Fraunces',serif;font-weight:600;font-size:22px;margin:0;letter-spacing:-0.01em}
-#topbar .salir{background:none;border:none;color:var(--marca);font-size:13px;cursor:pointer;font-family:inherit;padding:0;text-decoration:underline}
-@media (prefers-reduced-motion:no-preference){ .cinta>div{transition:width 0.4s ease} }
-</style>
-</head>
-<body>
-<div id="login">
-  <div class="box">
-    <h1>Economía de casa 🏡</h1>
-    <p>Introduce tu correo y contraseña para acceder.</p>
-    <div class="campo"><label for="lg-mail">Correo</label><input type="email" id="lg-mail" autocomplete="username"></div>
-    <div class="campo"><label for="lg-pass">Contraseña</label><input type="password" id="lg-pass" autocomplete="current-password"></div>
-    <button class="btn" id="lg-btn" onclick="hacerLogin()">Entrar</button>
-    <div class="err" id="lg-err"></div>
-  </div>
-</div>
-<div id="sync"></div>
-<div id="app" style="display:none">
-  <header>
-    <div id="topbar"><div><h1>Economía de casa</h1><div class="saludo" id="saludo"></div></div></div>
-    <span class="cuenta mono" id="hdr-cuenta"></span>
-  </header>
-  <main id="main"></main>
-</div>
-
-<div id="velo" onclick="cerrarHoja()"></div>
-<div id="hoja"></div>
-
-<nav id="nav"></nav>
-
-<script id="core">
-/* ============ SEMILLA ============ */
-const SEED = {"schemaVersion": 1, "seedRev": 4, "categorias": [{"id": "hipoteca", "nombre": "Hipoteca", "grupo": "Vivienda", "tipo": "gasto", "planMes": 477.0, "metodoBase": "mediana"}, {"id": "comunidad", "nombre": "Comunidad", "grupo": "Vivienda", "tipo": "gasto", "planMes": 75.0, "metodoBase": "mediana"}, {"id": "suministros", "nombre": "Suministros (luz/agua/gas)", "grupo": "Vivienda", "tipo": "gasto", "planMes": 101.0, "metodoBase": "mediana"}, {"id": "mantenimiento", "nombre": "Mantenimiento hogar", "grupo": "Vivienda", "tipo": "gasto", "planMes": 74.0, "metodoBase": "mediana"}, {"id": "bricolaje", "nombre": "Bricolaje/Muebles/Menaje", "grupo": "Vivienda", "tipo": "gasto", "planMes": 18.0, "metodoBase": "mediana"}, {"id": "limpieza", "nombre": "Limpieza casa", "grupo": "Vivienda", "tipo": "gasto", "planMes": null, "metodoBase": "anualizado"}, {"id": "telecom", "nombre": "Telecomunicaciones", "grupo": "Vivienda", "tipo": "gasto", "planMes": 89.0, "metodoBase": "mediana"}, {"id": "supermercado", "nombre": "Supermercado", "grupo": "Alimentación", "tipo": "gasto", "planMes": 1103.0, "metodoBase": "mediana"}, {"id": "restauracion", "nombre": "Restauración/Bares", "grupo": "Restauración y ocio", "tipo": "gasto", "planMes": 533.0, "metodoBase": "mediana"}, {"id": "ocio_viajes", "nombre": "Ocio/Viajes", "grupo": "Restauración y ocio", "tipo": "gasto", "planMes": 211.0, "metodoBase": "mediana"}, {"id": "ocio_activ", "nombre": "Ocio/Espectáculos/Actividades", "grupo": "Restauración y ocio", "tipo": "gasto", "planMes": 18.0, "metodoBase": "mediana"}, {"id": "suscripciones", "nombre": "Suscripciones digitales", "grupo": "Restauración y ocio", "tipo": "gasto", "planMes": 32.0, "metodoBase": "mediana"}, {"id": "combustible", "nombre": "Combustible/Transporte", "grupo": "Transporte y coche", "tipo": "gasto", "planMes": 320.0, "metodoBase": "mediana"}, {"id": "prestamo_coche", "nombre": "Préstamo coche", "grupo": "Transporte y coche", "tipo": "gasto", "planMes": null, "metodoBase": "anualizado"}, {"id": "coche_mant", "nombre": "Coche (mantenimiento/ITV)", "grupo": "Transporte y coche", "tipo": "gasto", "planMes": 38.0, "metodoBase": "anualizado"}, {"id": "educacion", "nombre": "Educación/Actividades niños", "grupo": "Niños", "tipo": "gasto", "planMes": 316.0, "metodoBase": "mediana"}, {"id": "salud", "nombre": "Salud/Farmacia", "grupo": "Personal y salud", "tipo": "gasto", "planMes": 239.0, "metodoBase": "mediana"}, {"id": "ropa", "nombre": "Ropa/Complementos", "grupo": "Personal y salud", "tipo": "gasto", "planMes": 270.0, "metodoBase": "mediana"}, {"id": "estetica", "nombre": "Peluquería/Estética", "grupo": "Personal y salud", "tipo": "gasto", "planMes": 57.0, "metodoBase": "mediana"}, {"id": "deporte", "nombre": "Deporte/Material", "grupo": "Personal y salud", "tipo": "gasto", "planMes": 22.0, "metodoBase": "mediana"}, {"id": "online", "nombre": "Compras online", "grupo": "Compras", "tipo": "gasto", "planMes": 242.0, "metodoBase": "mediana"}, {"id": "electronica", "nombre": "Electrónica", "grupo": "Compras", "tipo": "gasto", "planMes": 2.0, "metodoBase": "anualizado"}, {"id": "regalos", "nombre": "Regalos/Familiares", "grupo": "Compras", "tipo": "gasto", "planMes": 40.0, "metodoBase": "mediana"}, {"id": "seguros", "nombre": "Seguros", "grupo": "Finanzas e impuestos", "tipo": "gasto", "planMes": 121.0, "metodoBase": "anualizado"}, {"id": "impuestos", "nombre": "Impuestos/Tasas", "grupo": "Finanzas e impuestos", "tipo": "gasto", "planMes": 16.0, "metodoBase": "mediana"}, {"id": "comisiones", "nombre": "Comisiones bancarias", "grupo": "Finanzas e impuestos", "tipo": "gasto", "planMes": 9.0, "metodoBase": "anualizado"}, {"id": "prestamos", "nombre": "Otros préstamos", "grupo": "Finanzas e impuestos", "tipo": "gasto", "planMes": null, "metodoBase": "anualizado"}, {"id": "efectivo", "nombre": "Efectivo (cajero)", "grupo": "Efectivo", "tipo": "gasto", "planMes": 490.0, "metodoBase": "mediana"}, {"id": "mascotas", "nombre": "Mascotas", "grupo": "Otros", "tipo": "gasto", "planMes": 41.0, "metodoBase": "anualizado"}, {"id": "bizum_env", "nombre": "Bizum enviado (a revisar)", "grupo": "Otros", "tipo": "gasto", "planMes": null, "metodoBase": "anualizado"}, {"id": "otros_gasto", "nombre": "Otros gastos", "grupo": "Otros", "tipo": "gasto", "planMes": null, "metodoBase": "anualizado"}, {"id": "ahorro", "nombre": "Ahorro (traspaso propio)", "grupo": "Flujos internos", "tipo": "interno", "planMes": null, "metodoBase": null}, {"id": "traspasos", "nombre": "Traspaso cuentas propias", "grupo": "Flujos internos", "tipo": "interno", "planMes": null, "metodoBase": null}, {"id": "devoluciones", "nombre": "Devolución compra", "grupo": "Flujos internos", "tipo": "interno", "planMes": null, "metodoBase": null}, {"id": "nomina", "nombre": "Nómina", "grupo": "Ingresos", "tipo": "ingreso", "planMes": null, "metodoBase": null}, {"id": "dev_tributaria", "nombre": "Devolución tributaria", "grupo": "Ingresos", "tipo": "ingreso", "planMes": null, "metodoBase": null}, {"id": "bizum_rec", "nombre": "Bizum recibido", "grupo": "Ingresos", "tipo": "ingreso", "planMes": null, "metodoBase": null}, {"id": "otros_ingresos", "nombre": "Otros ingresos", "grupo": "Ingresos", "tipo": "ingreso", "planMes": null, "metodoBase": null}], "reglas": {"comercios": {"medeiros y cabell": "salud", "bugella y rubio s": "salud", "prestigiacom": "online", "alegria portomagn": "ocio_viajes", "ilusiona nassica": "regalos", "negrillo.es": "coche_mant", "sede_getafe": "impuestos", "virgo belleza": "estetica", "a la cazuela": "restauracion", "paypal *justeatsp": "restauracion", "paco araque": "ropa", "getafe cf taquill": "ocio_activ", "la trastienda de": "supermercado", "cuota t. debit 04000004tcv cuota tarjeta": "impuestos", "uned no regladas": "educacion", "naturenglish sl": "educacion", "dolce sira": "restauracion", "zara": "ropa", "0150-consum peãis": "supermercado", "pollos jj": "supermercado", "alimentacion y ba": "supermercado", "ilunion alcora": "restauracion", "beefcious getafe": "restauracion", "3 h mas dos decor": "bricolaje", "miravia.es": "regalos", "hug and clau isla": "ropa", "just eat spain, s": "restauracion", "joy sushi": "supermercado", "el corte ingles e": "ropa", "primark islazul": "ropa", "alimerka ribadese": "supermercado", "zara.com": "ropa", "kiwoko nassica": "mascotas", "maxidecor": "supermercado", "pepco 241024 geta": "ropa", "kamiãoko jatetxea": "restauracion", "dec getafe 3": "ropa", "puntfrank restaur": "restauracion", "talleres miguel": "combustible", "supercor express": "ropa", "molcajete y tejol": "restauracion", "openfamily getafe": "supermercado", "alimerka-gasoline": "supermercado", "cortefieles": "ropa", "libreria paris": "regalos", "nike es": "ropa", "madrid bravos": "ocio_activ", "women secret": "ropa", "bludecor": "supermercado", "paypal *madridthe": "ropa", "ocine x madrid": "ocio_viajes", "alicia salas herr": "regalos", "donde siempre": "restauracion", "tacita getafe": "restauracion", "conjuro sl": "ocio_activ", "freiduria maria": "restauracion", "padel nuestro": "ropa", "el aljibe": "restauracion", "iryob2c": "ocio_viajes", "s.c.a. virgen de": "supermercado", "loomisp*pipilacha": "restauracion", "drayza peãiscola": "ocio_viajes", "www cinesa es": "ocio_viajes", "el corte ingles g": "ropa", "la marsela": "restauracion", "emilio paris ante": "restauracion", "qwantic jump": "ocio_viajes", "hogar del jubilad": "restauracion", "mr ice & cream": "restauracion", "coreactividades formativas astercam s l a n.infant": "educacion", "miravia": "ropa", "paypal *glovo": "restauracion", "e.s. porcuna": "combustible", "yamaga": "restauracion", "lefties.com": "ropa", "paypal *timpers": "ropa", "granja miriam": "educacion", "vips isla azul ma": "restauracion", "paypal *dazn de": "suscripciones", "cedipsa e.s. loes": "combustible", "toledo entradas": "ocio_viajes", "la trasiega resta": "restauracion", "es vilagrassa": "combustible", "bk villaverde": "restauracion", "moventum clinic s": "salud", "ls madrid islazul": "ropa", "perfumeria primor": "ropa", "el rincon de tio": "restauracion", "areas sants estac": "restauracion", "global talent ser": "ocio_viajes", "mgp*wallapop s l": "online", "sinomil s.l": "combustible", "shein.com": "ropa", "cortefiel": "ropa", "slot4ever": "regalos", "kiosko de jesus": "restauracion", "quimoalar, s.l": "ropa", "crocantickets": "ocio_viajes", "vetusta rubio hos": "restauracion", "pasteleria elez": "restauracion", "new era cc getafe": "ropa", "compra entradas o": "ocio_viajes", "lobo flaco": "ropa", "zala ndo pay": "ropa", "carniceria jilico": "supermercado", "papajohns.es": "restauracion", "apartaments loli": "ocio_viajes", "parfois madrid c.": "ropa", "piojitos fuera ge": "salud", "midas sector 3": "combustible", "paypal *elcortein": "ropa", "masymas 36": "supermercado", "la surferita": "ocio_viajes", "textiles y non-fo": "ropa", "paypal *jimmy lio": "online", "getafe iniciativa": "combustible", "loteria el hada m": "efectivo", "el corte ingles": "ropa", "misako cc. islazu": "ropa", "express pxm paseo": "supermercado", "mucho mas": "restauracion", "carref getafe": "supermercado", "bk30652 john leno": "restauracion", "la verbena": "restauracion", "paypal *nike": "ropa", "sp kimoa spain": "ropa", "adidas getafe mbf": "ropa", "alimentacion y fr": "supermercado", "zara reduced": "ropa", "mundo electronica": "online", "la amistosina sl": "supermercado", "paypal *swatchgro": "online", "ayto madrid pago": "impuestos", "paypal *google go": "online", "telpark": "combustible", "sakura experience": "restauracion", "goiko c niza m": "restauracion", "isabel molina gom": "restauracion", "horizonte": "restauracion", "ultramarin": "restauracion", "rest la morenilla": "restauracion", "parkia arenal dig": "combustible", "sumo diverso sl": "restauracion", "tintoreria nines": "ropa", "decimas s.l.": "deporte", "zara espana s a": "ropa", "bagarciva sal": "combustible", "enver pote": "restauracion", "libreria lobo fla": "ocio_viajes", "springfield mixta": "ropa", "autopistas terras 04000015tcr operacion tarjeta": "combustible", "sublime x madrid": "restauracion", "decimas getafe 3": "deporte", "es benicarlo": "combustible", "gate gourmet spai": "supermercado", "mirador tupamaro": "restauracion", "foster's hollywoo 04000015tcr operacion tarjeta": "restauracion", "batra, slu": "combustible", "paypal *cortefiel": "ropa", "costello rio": "restauracion", "innovamoda": "ropa", "hostal del carme": "ocio_viajes", "carl's jr": "restauracion", "brief atocha": "restauracion", "cedipsa e.s. sans": "combustible", "karting pinto onl": "ocio_viajes", "variety oriental": "online", "carglass b v suc": "combustible", "el cafe del tren": "restauracion", "cocedero mariscos": "supermercado", "peu de via": "restauracion", "springfield-mixta": "ropa", "verdecora arroyoc": "bricolaje", "el obrador de goy": "restauracion", "bershka": "ropa", "castellana de aut 04000015tcr operacion tarjeta": "combustible", "vans": "deporte", "al fondo hay siti": "restauracion", "e.s. avda. sarria": "combustible", "rompeolas sidreri": "restauracion", "primark madrid -": "ropa", "citees madridccis": "ropa", "meditt23": "salud", "rent. la parrilla": "restauracion", "zapateria ideal": "ropa", "museo fernando al": "ocio_viajes", "dulce store": "restauracion", "nikepos_es": "ropa", "pepe jeans outlet": "ropa", "audio lain": "electronica", "sp bilbao esp": "ocio_viajes", "lefties": "ropa", "paypal *nintendo": "online", "marlossport sl": "deporte", "smash hiro": "restauracion", "sp colvin europe": "regalos", "d candela": "restauracion", "dekorazon isla az": "bricolaje", "eden plaza cafe": "restauracion", "cash fresh porcun": "supermercado", "servei de maquine": "combustible", "springfield": "ropa", "la iglesiona": "restauracion", "mountain art sl": "deporte", "pandora islazul": "ropa", "holiday inn barce": "restauracion", "loomisp*celestial": "online", "jesus yuste herna": "salud", "paypal *zara": "ropa", "vips nassica madr": "restauracion", "tulotero 04000163sio compra con bizum": "efectivo", "gran bazar": "ropa", "corepiscina aristos natac.infantil1d/s febrero24+m": "educacion", "akelarre sant cug": "restauracion", "paypal *papa john": "restauracion", "meson el labrador": "restauracion", "paypal *ticketmas": "online", "dni/pasaporte get": "impuestos", "u.s. la amistosin": "restauracion", "sp brownie": "ropa", "t530 lovit x madr": "restauracion", "basics princesa (": "ropa", "marmi serrat": "restauracion", "zara espaãa": "ropa", "relay ave santa j": "supermercado", "bazar asia porcun": "bricolaje", "paypal *playstati": "online", "runni pandora 3": "ropa", "cuevalinda": "restauracion", "mr. coffee and bu": "restauracion", "el rincon del qui": "restauracion", "paypal *alipay eu": "online", "parclick s.l.": "combustible", "sport isla azul d": "deporte", "dinamo educacion,": "educacion", "paypal *quimoalar": "online", "sopas hostelria 2": "restauracion", "bazar jun": "bricolaje", "tienda outlet las": "ropa", "privalia": "online", "l'ombra llibreria": "educacion", "monroebakes s.l.": "restauracion", "bebidas de calida": "supermercado", "el capricho s.l.": "restauracion", "cedipsa e.s. briv": "combustible", "wokinzao": "restauracion", "mr coffee & burge": "restauracion", "vips las rozas": "restauracion", "goog vibes only": "suscripciones", "lamford center": "ocio_viajes", "hawkers isla azul": "ropa", "dgt sanciones int": "impuestos", "karting museo fer": "ocio_viajes", "sumup *la casa d": "restauracion", "el corte ingles v": "ropa", "thermas griãon": "ocio_viajes", "thermas de grinon": "ocio_viajes", "e.s.mace s.l.": "combustible", "irish rover": "restauracion", "nuevo hogar": "bricolaje", "molica": "restauracion", "el albero": "restauracion", "bk villaverde 04000163sio compra con bizum": "restauracion", "los cazurros": "ocio_activ", "el capricho peãis": "restauracion", "marmi serrat sl": "restauracion", "bkt-mad-park-o-ca": "combustible", "e.s. porcuna, s.l": "combustible", "parabotika nutric": "salud", "getafe madrid cli": "salud", "aparcamiento j. b": "combustible", "stradivarius": "ropa", "prg retail group": "ropa", "el calamar": "restauracion", "crocs spain": "ropa", "eroski center alm": "supermercado", "ritualscosmetics": "estetica", "pasion por el pul": "restauracion", "cinesa getafe-nas": "ocio_viajes", "fish artisan": "restauracion", "yes te 1616": "restauracion", "le creuset las ro": "bricolaje", "la esquina tabern": "restauracion", "8.ocio 2025": "ocio_activ", "can vilamari": "restauracion", "pub santa maria": "restauracion", "admon.loter.11 04000163sio compra con bizum": "efectivo", "zapatos tangherin": "ropa", "athletic museoa-m": "ocio_viajes", "la bruja de oro": "efectivo", "admon.loter.11": "efectivo", "boston cc isla az": "ropa", "converse 8111": "deporte", "getafe2": "combustible", "e.s. way atalaya,": "combustible", "lagoberria restau": "restauracion", "deporticket.com": "ocio_activ", "paypal *colvin": "online", "kiwoko pet, s.l.u": "mascotas", "cafe bilbao": "restauracion", "ukvi etamob000005": "combustible", "vainilla": "restauracion", "c almazan": "restauracion", "katalo": "online", "marvelous": "ropa", "anca el mori": "restauracion", "fisioterapia los": "salud", "libreria vila": "educacion", "tacita boadilla": "restauracion", "getafe project": "ocio_activ", "the good burguer": "restauracion", "fleurop interflor": "regalos", "mc donald's madri": "restauracion", "masymas - 36": "supermercado", "area servicio la": "combustible", "woman secret": "ropa", "mango getafe 3": "ropa", "legends hospitali": "restauracion", "diverjump leganes": "ocio_activ", "forus getafe nort": "ocio_activ", "ilusiona diversia": "ocio_activ", "changke s storied": "restauracion", "outlet sambil": "ropa", "km0 deportes": "deporte", "comercial fruver": "supermercado", "diverland": "ocio_activ", "paypal *hennesmau": "online", "urbieta": "restauracion", "alehop 359 peãisc": "regalos", "ayto madrid depor": "ocio_activ", "primark parque su": "ropa", "la crema del ques": "restauracion", "mgp*vinted": "online", "playtomic.io d9ba": "ocio_activ", "playtomic.io a468": "ocio_activ", "playtomic.io 0063": "ocio_activ", "playtomic.io 48ab": "ocio_activ", "juguettos": "regalos", "paypal *armonias": "online", "la espiga de oro": "supermercado", "glovostore": "online", "the body shop sta": "estetica", "normal madrid": "bricolaje", "fcia.higinio mart": "salud", "alboroque 2.0": "restauracion", "ks floristeria": "regalos", "el hangar": "restauracion", "tabel la sport": "deporte", "licencia 10776": "impuestos", "primark rivas": "ropa", "licencia 3729": "impuestos", "salon de te neria": "restauracion", "legio vii": "restauracion", "6232 getafe": "combustible", "miniso x madrid": "regalos", "cedipsa e.s. para": "combustible", "libreria universi": "educacion", "colvin europe sl": "regalos", "bk12390 alcorcon": "restauracion", "alimentacion": "supermercado", "dec islazul": "deporte", "gavia": "ropa", "behima j baserri": "restauracion", "discam 4": "combustible", "tvr emv madrid": "suministros", "las vegas": "restauracion", "guggenheim bilbao": "ocio_viajes", "puma outlet madri": "deporte", "oro vivo sa": "regalos", "museo de la sidra": "ocio_viajes", "biteme cafe": "restauracion", "merkal rivas": "ropa", "espasa calpe": "educacion", "pandemil cafe sl": "restauracion", "monroebakes": "restauracion", "pfs zacatrus": "ocio_activ", "carglass getafe i": "combustible", "primor parquesur": "ocio_viajes", "tunelspan barrera 04000015tcr operacion tarjeta": "restauracion", "mc donalds-legane": "restauracion", "family cash legan": "supermercado", "kiabi alcorcon": "ropa", "tren turistico": "ocio_viajes", "kubo king": "restauracion", "paypal *zalandose": "ropa", "el texu en madrid": "restauracion", "paypal *casadelib": "online", "dunkincoffee": "restauracion", "xana": "restauracion", "coalla retiro": "supermercado", "roca ribes s.a.": "supermercado", "glovo 19may cmvg3": "restauracion", "e.s.meroil galile": "combustible", "asado hamburguesa": "restauracion", "marmar pza nueva": "restauracion", "mocca ..": "restauracion", "mocca.": "restauracion", "aparcamiento pza": "combustible", "bulevar": "restauracion", "hundred online": "ropa", "discam 1": "combustible", "villaverde (n)": "combustible", "playtomic.io fd50": "ocio_activ", "el patio vertical": "ocio_activ", "bazar asia": "bricolaje", "paypal *gamer out": "online", "glovo 12may c8cq2": "restauracion", "bombon boss cruz": "restauracion", "mc donald's sants": "restauracion", "wenzhou supermerc": "supermercado", "natura puerta de": "bricolaje", "aut. vasco aragon 04000015tcr operacion tarjeta": "combustible", "san lucas": "restauracion", "surtimovil sa": "electronica", "impulsa eventos e": "ocio_activ", "el rincon de tio 04000015tcr operacion tarjeta": "restauracion", "pans and company": "restauracion", "fcia la arboleda-": "salud", "sp yesitex": "ropa", "the craft tabeern": "restauracion", "e.s porcuna": "combustible", "interiorismo carl": "bricolaje", "tiger alcala de h": "bricolaje", "hug and clau plaz": "ropa", "zhan suzhen": "supermercado", "market avda. niza": "supermercado", "licencia 10491": "impuestos", "carnicas y embuti": "supermercado", "benetton outlet g": "ropa", "paypal *fragcomer": "online", "kiabi isla azul": "ropa", "hostal-rest. el s": "restauracion", "ap hospital grego": "salud", "fritas vizcaya": "supermercado", "patatas virgen al": "supermercado", "maria esther dieg": "salud", "domingo tapas": "restauracion", "muja - taquilla 2": "ocio_viajes", "el tonel": "restauracion", "jott gijon": "ropa", "heladeria vainill": "restauracion", "natura parque sur": "ocio_viajes", "vips getafe": "restauracion", "02278746k/791/2000/ / impuestos 01600000dis impues": "impuestos", "uniqlo granvia": "ropa", "leganes ramos sie": "combustible", "facciamo farina": "restauracion", "the one beer": "restauracion", "paypal *tristargr": "online", "the shack": "restauracion", "google photos": "suscripciones", "raffa gelati verd": "restauracion", "almagarpe 2019 sl": "restauracion", "09030751p 09030751p 2?:bizum asociacion getafe fam": "regalos", "save the children": "regalos", "nerea martinez se": "salud", "cerro ii": "combustible", "paypal *nintendoe": "online", "cinesa mendez alv": "ocio_viajes", "maui beach": "restauracion", "changke's storied": "restauracion", "sumup *cayetano": "restauracion", "sector 3": "combustible", "cristobal lopez m": "salud", "del cacho gil ent": "salud", "libreria reno": "educacion", "crf express pase": "supermercado", "escurial estac se": "combustible", "sumup *la cuevon": "restauracion", "cedipsa los angel": "combustible", "la calle": "restauracion", "ee ss villamarxan": "combustible", "beer station": "restauracion", "pecris eventos": "ocio_activ", "pull and bear": "ropa", "atracciones m gra": "ocio_activ", "city castello": "restauracion", "babylon park spai": "combustible", "home markt": "bricolaje", "womens secret 512": "ropa", "vips smart nassic": "restauracion", "la tienda": "online", "supermercat bon p": "supermercado", "sp companiafantas": "ropa", "476 - cf ave sant": "restauracion", "homemark": "bricolaje", "casa enfruns sl": "ocio_viajes", "tienda lili": "ropa", "the champions bur": "restauracion", "game": "electronica", "4en1 comunicacion": "telecom", "casa de los caram": "regalos", "acuario optico": "salud", "pepco 241109 madr": "bricolaje", "las delicias": "restauracion", "aucalsa tarjetas": "combustible", "glovo 11may ca1wd": "restauracion", "espai abacus": "educacion", "encuentro modas c": "ropa", "perfumerias primo": "salud", "dinamo educacion": "educacion", "british airways plc serv.recep.transf 03600052tdi ": "ropa", "cjtavares.com": "online", "froiz getafe": "supermercado", "garaje galileo s.": "combustible", "vips cc la gavia": "restauracion", "ifema": "ocio_viajes", "mni*la salchicha": "restauracion", "womensecret": "ropa", "quesos iniesta": "supermercado", "orion center": "ocio_viajes", "kiddy's class": "educacion", "miguel angel cabe": "salud", "vinoteca izan": "supermercado", "la nueva cubierta": "ocio_viajes", "10214 getafe parq": "combustible", "rodilla estacion": "restauracion", "pol. juan de la c": "ocio_activ", "pk vp jardin de r": "combustible", "obrador de goya": "supermercado", "el mirador de mon": "restauracion", "cred mirabueno": "hipoteca", "ofic turismo ayto": "ocio_viajes", "sq *nuevo estadio": "ocio_activ", "parkia espigon tn": "combustible", "sfera palencia": "ropa", "fcia a rivera rgu": "salud", "carniceria arambu": "supermercado", "bazar oriental": "bricolaje", "p.esperanza g.par": "salud", "restauracion area": "restauracion", "el bercial h.": "salud", "muncyt alcobendas": "ocio_viajes", "catedral de palen": "ocio_viajes", "verkami.com": "online", "inside palencia": "ropa", "paypal *stikets": "online", "garaje farus": "combustible", "sqrups getafe 2": "supermercado", "sodexo edificio g": "restauracion", "la penultima de c": "restauracion", "the gold.s abbey": "restauracion", "consumiciones eve": "restauracion", "getafe 5": "combustible", "rasillo s.a.": "restauracion", "el rey de los tac": "restauracion", "ocio getafe": "ocio_activ", "carlos hashem pam": "salud", "tiger stores - ma": "bricolaje", "dunkin - centro c": "restauracion", "the body shop esp": "estetica", "el rincon de dali": "restauracion", "desarrollos de ho": "suministros", "nyx*areassau": "restauracion", "carref vallecas": "supermercado", "alfonso moreno": "salud", "pepco 241030 riva": "bricolaje", "jaime global": "online", "petrocat e.s.t. c": "combustible", "primaprix s.l.u": "supermercado", "pub el canton": "restauracion", "benetton cc sambi": "ropa", "juguettos cc isla": "regalos", "apple.com/bill": "online", "tito bustillo taq": "ocio_viajes", "mac donald s diag": "restauracion", "donde mariana": "restauracion", "el tio de la rosc": "restauracion", "churreria thalia": "restauracion", "druni cc x madrid": "salud", "grupo kaboser s.l": "bricolaje", "ivan luiz girodan": "salud", "felix buquerin sl": "salud", "dominguez la tabe": "restauracion", "mc donalds sant a": "restauracion", "panaderia san fra": "supermercado", "tunelspan b.vallv 04000015tcr operacion tarjeta": "combustible", "el zopico": "restauracion", "yoyoso family s.l": "bricolaje", "cm309 alcorcon": "combustible", "e.s. maypa, s.l.": "combustible", "expancha3": "restauracion", "lima limon": "restauracion", "casa manuela del": "restauracion", "hiper feliz": "supermercado", "primaprix t112": "supermercado", "ancara food": "restauracion", "fotored delicias": "electronica", "todo cien y mas..": "bricolaje", "alipay": "online", "parfois": "ropa", "jysk imagina, get": "bricolaje", "frutos secos": "supermercado", "web crtm": "combustible", "getafe iii": "combustible", "sampedro pasteler": "supermercado", "la paloma": "restauracion", "articulo playa po": "ropa", "infomax": "electronica", "pepco 241059 pale": "bricolaje", "susana y victor s": "traspasos", "kindle svcs 34911": "online", "primor islazul": "salud", "dolce peccato": "restauracion", "jie da ribadesell": "restauracion", "la papereria": "educacion", "la estrella de ca": "restauracion", "pastisseria gallo": "restauracion", "ferretti x madrid": "restauracion", "1481 sant cugat g": "restauracion", "tienda": "online", "el chulo de madri": "restauracion", "aparcament vinyes": "combustible", "x madrid": "ocio_activ", "jalfe s.l..": "bricolaje", "el arca de noe": "mascotas", "fotex": "electronica", "la coco": "restauracion", "cf ave sants esta": "restauracion", "granier alcala": "supermercado", "ohñgar getafe": "bricolaje", "autopista r4 seit": "combustible", "administracion de": "efectivo", "primark islazul 04000015tcr operacion tarjeta": "ropa", "huella vegana roz": "restauracion", "pontejos sur mart": "ropa", "autopista r4 seit 04000015tcr operacion tarjeta": "combustible", "pet market sl": "mascotas", "13607 - vallecas": "combustible", "aldi getafe secto": "supermercado", "cafestore sevilla": "restauracion", "jaen hosteleria": "restauracion", "levadura madre": "supermercado", "pastisseria i cat": "restauracion", "tgb parquesur": "restauracion", "jose enrique hour": "salud", "qgat coffe lunch": "restauracion", "montseny norte": "combustible", "app crtm": "combustible", "fics- telefonia y": "telecom", "hamburgueseria": "restauracion", "autoservicio": "supermercado", "paypal *smartonea": "online", "toy planet": "regalos", "paypal *google pl": "online", "mr. wonderful xma": "regalos", "aparcamiento ordo": "combustible", "nyx*bp": "combustible", "e.s. vegas de tri": "combustible", "tunels vallvi 04000015tcr operacion tarjeta": "combustible", "fcia. baeza": "salud", "bk carretas 8": "restauracion", "e s las navas": "combustible", "el mos": "restauracion", "granier rambla": "supermercado", "compra de prime v": "suscripciones", "tgtg 80wy3vbtvwgf": "supermercado", "supermercat solma": "supermercado", "urbansafari": "ocio_viajes", "primaprix palenci": "supermercado", "tienda alimentaci": "supermercado", "kiosco motora": "ocio_viajes", "ballus": "ocio_viajes", "aparcamiento colo": "combustible", "rincon de salva": "ocio_viajes", "soul climb legane": "ocio_viajes", "pasteleria la agu": "restauracion", "merkal getafe nas": "ropa", "alliance vending": "restauracion", "dolcemania atocha": "restauracion", "hospital sur de a": "salud", "pay*ana isabel pe": "online", "nyx*airservspain": "online", "6.ocio 2025": "restauracion", "la rivera de los": "restauracion", "seitt r3 r5": "restauracion", "la alternativa": "restauracion", "alimentacion pana": "supermercado", "happy palencia": "restauracion", "juan valdez c.c l": "restauracion", "maq. 016": "restauracion", "delikia-hosp quir": "restauracion", "nyx*selecta": "restauracion", "nyx*abserviciosse": "restauracion", "hnos ortiz sanz": "restauracion", "aena aeropuertos": "combustible", "paypal *google st": "online", "autoestradas easy": "restauracion", "excmo ayto de tol": "restauracion", "nyx*serveoservici": "restauracion", "caseta los molino": "restauracion", "transys madrid": "restauracion", "chatter cafe geta": "restauracion", "serv.apert. descub. 03600030pas serv.apert. descub": "restauracion", "google play apps": "online", "air serv spain": "restauracion", "spay&latam servic": "restauracion", "la noguera de poz": "restauracion", "delikia sp": "restauracion", "aena sevilla(park": "combustible", "one hundred restr": "restauracion", "pokiddo": "restauracion", "ab servicios sele": "restauracion", "forno de lugo": "restauracion", "expramirezdelprad": "restauracion", "brg progres, slu": "restauracion", "easy vending sl": "restauracion", "castellana de aut": "combustible", "foster's hollywoo": "restauracion", "fusiona mant": "mantenimiento", "corepiscina": "educacion", "tulotero": "efectivo"}, "palabrasClave": [["ahorro", ["AHORRO "]], ["efectivo", ["REINT.CAJERO", "REINTEGRO CAJERO"]], ["nomina", ["DOCENTES MADRID-SUR", "NOMINA", "PAGA EXTRA"]], ["comunidad", ["CORERESIDENCIAL", "COMUNIDAD"]], ["suministros", ["IBERDROLA", "ENDESA", "NATURGY", "ENRGTRAD", "CANAL DE ISABEL", "GAS NATURAL", "ELECTRICIDAD"]], ["prestamo_coche", ["COREVOLKSWAGEN", "VOLKSWAGEN BANK"]], ["hipoteca", ["PRES.", "PRESTAMO", "VTO. PRESTAMO", "HIPOTECA"]], ["seguros", ["PUNTO UNO BROKER", "MAPFRE", "MUTUA", "MMT SEGUROS", "AXA", "ALLIANZ"]], ["mantenimiento", ["FUSIONA MANTENIMIENTOS", "MANTENIMIENTO"]], ["educacion", ["COREDINAMO", "CORECM", "COREARISTOS", "COREJUAN RAM", "CORECLUB", "COMEDOR", "INSCRIPCION", "GUARDERIA", "COLEGIO", "ACADEMIA"]], ["mascotas", ["UN PELUDO EN CASA", "VETERINAR", "CLINICA VETERINARIA"]], ["estetica", ["BARBERIA", "PELUQUERIA", "ESTETICA", "SALON DE BELLEZA"]], ["deporte", ["DECATHLON", "FOREVER FITNESS", "GIMNASIO"]], ["electronica", ["SAMSUNG IBERIA", "PCCOMPONENTES", "MEDIAMARKT", "FNAC"]], ["ocio_viajes", ["CAMPING", "HOTEL", "APACHE", "BONO 10", "AIRBNB", "TICKETMASTER", "BOOKING.COM", "RYANAIR", "VUELING", "IBERIA ", "CENTAURO"]], ["supermercado", ["MERCADONA", "AHORRAMAS", "CARREFOUR", "LIDL", "DIA ", "COSTCO", "HIPERCOR", "ALCAMPO", "SUPERMERCADO", "CORP ALI", "DANFRUVER", "FRUTAS ", "FRUTERIA"]], ["restauracion", ["BAR ", "BAR OS", "RESTAURANT", "CAFETERIA", "CERVECERIA", "KEBAB", "PIZZA", "MCDONALD", "BURGER", "BOCANEGRA", "BALCON CAPRICHO", "SANTA JULIA", "UNA BOLA", "CAPITAN CHICKEN", "GRUPO CAPITANO", "DIVINO PECADO", "HAPPY PALACIO", "EL RINCON DE SANT", "TABERNA", "CERVEZAS", "OS'PEREGRINOS", "JJ DOMINE", "JUSTEATSP"]], ["combustible", ["PETROPRIX", "REPSOL", "CEPSA", "GASOLINERA", "SHELL", " BP ", "PARKING", "ITV", "EMT", "METRO", "RENFE", "UBER", "CABIFY", "TAXI"]], ["suscripciones", ["NETFLIX", "SPOTIFY", "HBO", "DISNEY", "PRIME VIDEO", "PLAYSTATION", "YOUTUBE"]], ["online", ["AMAZON", "AMZN", "ALIEXPRESS", "WWW."]], ["salud", ["FARMACIA", "CLINICA DENTAL", "DENTAL", "OPTICA", "NATURITAS"]], ["bricolaje", ["BRICO DEPOT", "LEROY MERLIN", "IKEA", "FERRETERIA"]], ["traspasos", ["PAGO TRANSFERENCIAS", "PAGO TRASPASOS", "TRASPASO", "REVOLUT"]], ["regalos", ["REGALO"]], ["telecom", ["VODAFONE", "MOVISTAR", "ORANGE", "JAZZTEL"]], ["impuestos", ["AYUNTAMIENTO"]], ["ocio_activ", ["SPUTNIK CLIMBING", "INDOORWALL", "PISTA HIELO"]], ["comisiones", ["CUOTA TARJETA", "CUOTA T. DEBIT", "COMISION"]], ["combustible", ["AUTOPISTAS", "PEAJE"]], ["impuestos", ["AGENCIA ESTATAL DE ADMINISTRACION TRIBUTARIA", "AGENCIA TRIBUTARIA"]], ["educacion", ["ACTIVIDADES FORMATIVAS", "GRANJA ESCUELA"]], ["dev_tributaria", ["DEVOLUCIONES TRIBUTARIAS"]], ["limpieza", ["LIMPIEZA"]], ["devoluciones", ["DEVOLUCION COMPRA"]], ["otros_ingresos", ["INGRESO CAJERO"]]], "cuentasAhorro": [], "cuentasPropias": [], "nombresPropios": [], "clavesProhibidas": ["abono", "bizum enviado", "bizum recibido", "compra", "compra con tarjeta", "cuota tarjeta", "operacion tarjeta", "pago", "pago transferencias", "pago traspasos", "recibo", "reintegro", "transferencia"], "codigos": {"11": "efectivo", "05": "hipoteca"}}};
-const DATOS_PRIVADOS = (window.DATOS_PRIVADOS || null);
-/* ============ UTILIDADES ============ */
-const fmtEUR = n => new Intl.NumberFormat('es-ES',{style:'currency',currency:'EUR',maximumFractionDigits:Math.abs(n)>=1000?0:2}).format(n);
-const fmtEUR2 = n => new Intl.NumberFormat('es-ES',{style:'currency',currency:'EUR'}).format(n);
-const MESES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
-const fmtYM = ym => { const [y,m]=ym.split('-'); return MESES[+m-1]+' '+y; };
-const fmtDia = f => { const [,m,d]=f.split('-'); return d+' '+MESES[+m-1].slice(0,3); };
-const r2 = n => Math.round(n*100)/100;
-const esc = s => String(s??'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-
-function movId(fecha, importe, saldo){
-  return fecha+'|'+importe.toFixed(2)+'|'+(saldo==null?'x':saldo.toFixed(2));
-}
-/* dos movimientos reales pueden compartir fecha+importe+saldo (p.ej. dos compras idénticas
-   el mismo día); se discrimina con un sufijo estable según el orden dentro del extracto */
-function idUnico(base, vistos){
-  const n = (vistos.get(base)||0)+1; vistos.set(base,n);
-  return n===1 ? base : base+'#'+n;
-}
-function isoDate(v){
-  if (v instanceof Date) {
-    return v.getFullYear()+'-'+String(v.getMonth()+1).padStart(2,'0')+'-'+String(v.getDate()).padStart(2,'0');
-  }
-  if (typeof v === 'string'){
-    const m = v.trim().match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-    if (m) return m[3]+'-'+m[2]+'-'+m[1];
-    const m2 = v.trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
-    if (m2) return m2[1]+'-'+m2[2]+'-'+m2[3];
-  }
-  if (typeof v === 'number'){ // serial Excel
-    const d = new Date(Math.round((v-25569)*86400*1000));
-    return d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0');
-  }
-  return null;
-}
-const num = v => { if (v==null||v==='') return null; const n = typeof v==='number'?v:parseFloat(String(v).replace(/\./g,'').replace(',','.')); return isNaN(n)?null:n; };
-
-/* ============ PARSERS ============ */
-function detectarFormato(rows){
-  for (let i=0;i<Math.min(rows.length,8);i++){
-    const cells = (rows[i]||[]).map(c=>String(c??''));
-    if (cells.some(c=>c.includes('Número de cuenta'))) return {formato:'TT', headerIdx:i};
-    if (cells.some(c=>c==='Fecha') && cells.some(c=>c==='Importe')) return {formato:'MC', headerIdx:i};
-  }
-  return null;
-}
-
-function parseTT(rows, headerIdx){
-  const hdr = rows[headerIdx].map(c=>String(c??'').trim());
-  const col = name => hdr.findIndex(h=>h===name);
-  const iCuenta=col('Número de cuenta'), iFop=col('F. Operación'), iFval=col('F. Valor'),
-        iIng=col('Ingreso (+)'), iGas=col('Gasto (-)'), iSp=col('Saldo (+)'), iSn=col('Saldo (-)'),
-        iCC=col('Concepto común'), iCP=col('Concepto propio'), iR1=col('Referencia 1'), iR2=col('Referencia 2');
-  const iComps=[]; for (let k=1;k<=10;k++){ const i=col('Concepto complementario '+k); if(i>=0) iComps.push(i); }
-  const out=[]; let cuenta=null; const vistos=new Map();
-  for (let i=headerIdx+1;i<rows.length;i++){
-    const r=rows[i]||[];
-    const fecha=isoDate(r[iFop]); if(!fecha) continue;
-    if (!cuenta && r[iCuenta]) cuenta=String(r[iCuenta]).trim();
-    const ing=num(r[iIng])||0, gas=num(r[iGas])||0;
-    const importe=r2(ing-gas);
-    const saldo = num(r[iSp])!=null ? num(r[iSp]) : (num(r[iSn])!=null ? -num(r[iSn]) : null);
-    const partes=[];
-    for (const ic of iComps){ const v=r[ic]; if (typeof v==='string' && v.trim()) partes.push(v.trim().replace(/\s+/g,' ')); }
-    const ref2 = r[iR2]!=null ? String(r[iR2]).trim() : '';
-    if (ref2) partes.push(ref2);
-    out.push({
-      id: idUnico(movId(fecha,importe,saldo),vistos), fecha, fechaValor: isoDate(r[iFval])||fecha,
-      importe, saldo, descripcion: partes.join(' | '),
-      raw: { formato:'TT',
-        codComun: r[iCC]!=null ? String(Math.trunc(num(r[iCC])??-1)).padStart(2,'0') : null,
-        codPropio: r[iCP]!=null ? String(r[iCP]).replace(/\.0$/,'').padStart(3,'0') : null,
-        ref1: r[iR1]!=null?String(r[iR1]):null, ref2: ref2||null }
-    });
-  }
-  return {cuenta, movs: out};
-}
-
-function parseMC(rows, headerIdx){
-  const hdr = rows[headerIdx].map(c=>String(c??'').trim());
-  const col = n => hdr.findIndex(h=>h===n);
-  const iF=col('Fecha'), iFv=col('Fecha valor'), iM=col('Movimiento'), iMd=col('Más datos'), iI=col('Importe'), iS=col('Saldo');
-  let cuenta=null; const vistos=new Map();
-  const c0=String(rows[0]?.[0]??''); const m=c0.match(/cuenta\s+([A-Z0-9 ]+)/i); if(m) cuenta=m[1].trim();
-  const out=[];
-  for (let i=headerIdx+1;i<rows.length;i++){
-    const r=rows[i]||[];
-    const fecha=isoDate(r[iF]); if(!fecha) continue;
-    const importe=r2(num(r[iI])??0);
-    const saldo=num(r[iS]);
-    const partes=[String(r[iM]??'').trim()]; const md=String(r[iMd]??'').trim(); if(md) partes.push(md);
-    out.push({
-      id: idUnico(movId(fecha,importe,saldo),vistos), fecha, fechaValor: isoDate(r[iFv])||fecha,
-      importe, saldo, descripcion: partes.filter(Boolean).join(' | '),
-      raw: { formato:'MC', codComun:null, codPropio:null, ref1:null, ref2:null }
-    });
-  }
-  return {cuenta, movs: out};
-}
-
-/* ============ MOTOR DE CATEGORIZACIÓN ============ */
-// Trocea la descripción en sus partes de concepto (separadas por "|") en vez de tratarla
-// como un único texto plano. Así una coincidencia de nombre/cuenta propia en una parte no
-// compite con palabras sueltas de otra parte (p.ej. un memo de transferencia que además
-// contenga algo parecido a una palabra clave de comercio).
-// Marcadores de que un movimiento es una compra con tarjeta (no una transferencia). Se usan
-// tanto para no perder el nombre del titular al elegir "concepto" (conceptoDe) como para no
-// dejar que ese mismo nombre, si aparece en el ticket de una compra, la convierta en un traspaso.
-const MARCADORES_TARJETA = ['COMPRA CON TARJETA','OPERACION TARJETA','CUOTA T'];
-function partesConcepto(mov){
-  return (mov.descripcion||'').split('|').map(s=>s.trim().toUpperCase()).filter(Boolean);
-}
-function categorizar(mov, R){
-  const D = (mov.descripcion||'').toUpperCase();
-  const dl = D.toLowerCase();
-  const partes = partesConcepto(mov);
-  const enAlgunConcepto = valor => partes.some(p=>p.includes(valor));
-  const esCompraConTarjeta = MARCADORES_TARJETA.some(g=>D.includes(g));
-  const porNombrePropio = () => { for (const n of (R.nombresPropios||[])) if (enAlgunConcepto(n.toUpperCase())) return true; return false; };
-  // 1) cuentas de ahorro propias
-  for (const c of (R.cuentasAhorro||[])) if (enAlgunConcepto(c.toUpperCase())) return {cat:'ahorro', via:'regla'};
-  // 2) otras cuentas / bancos propios
-  for (const c of (R.cuentasPropias||[])) if (enAlgunConcepto(c.toUpperCase())) return {cat:'traspasos', via:'regla'};
-  // 3) nombre del titular u otro nombre propio en cualquier parte del concepto => traspaso entre
-  //    cuentas propias. Prioridad alta (antes que comercios y palabras clave): un traspaso
-  //    identificado por el nombre del titular (habitual en el concepto de las transferencias) no
-  //    debe perderse frente a coincidencias de texto de otra parte del mismo concepto (p.ej. un
-  //    memo que mencione un lugar o un bono que case con una palabra clave). Se excluyen aquí las
-  //    compras con tarjeta: si el ticket de una compra real incluye también el nombre del titular,
-  //    no debe convertirse en un traspaso (se comprueba más abajo, como última red de seguridad).
-  if (!esCompraConTarjeta && porNombrePropio()) return {cat:'traspasos', via:'regla'};
-  // 4) diccionario de comercios: gana la clave más larga
-  let best=null;
-  for (const k in R.comercios){ if (dl.includes(k) && (!best || k.length>best[0].length)) best=[k,R.comercios[k]]; }
-  if (best) return {cat:best[1], via:'dict'};
-  // 5) palabras clave (orden)
-  for (const [cat,kws] of R.palabrasClave){ for (const kw of kws){ if (D.includes(kw)) return {cat, via:'regla'}; } }
-  // 6) Bizum
-  const esBizum = D.includes('BIZUM') || (mov.raw.codComun==='04' && mov.raw.codPropio==='002');
-  if (esBizum) return {cat: mov.importe<0?'bizum_env':'bizum_rec', via:'codigo'};
-  // 7) códigos CaixaBank
-  if (mov.raw.codComun && R.codigos && R.codigos[mov.raw.codComun]) return {cat:R.codigos[mov.raw.codComun], via:'codigo'};
-  // 8) último recurso: nombre propio en una compra con tarjeta sin comercio ni palabra clave
-  //    reconocidos (mejor detectarlo como traspaso que dejarlo sin clasificar).
-  if (esCompraConTarjeta && porNombrePropio()) return {cat:'traspasos', via:'regla'};
-  return null;
-}
-
-/* concepto agrupador para la bandeja: persona del Bizum o comercio dominante.
-   R (por defecto REGLAS) se usa para no elegir como "comercio" una parte del concepto que en
-   realidad sea tu nombre o una de tus cuentas: eso aparece en muchísimos movimientos distintos
-   (es el titular, no el comercio) y usarlo como clave de "aplicar a similares" propondría
-   recategorizar en bloque movimientos que no tienen nada que ver entre sí. */
-function conceptoDe(mov, R=REGLAS){
-  const partes = (mov.descripcion||'').split('|').map(s=>s.trim()).filter(Boolean);
-  const pers = partes.find(p=>/^[A-ZÁÉÍÓÚÑa-záéíóúñ .-]+;[A-ZÁÉÍÓÚÑa-záéíóúñ .;-]+$/.test(p));
-  if (pers) return {tipo:'persona', clave: pers.replace(/;/g,' ').replace(/\s+/g,' ').trim()};
-  const GEN = MARCADORES_TARJETA;
-  const propios = [...(R?.cuentasAhorro||[]), ...(R?.cuentasPropias||[]), ...(R?.nombresPropios||[])].map(s=>s.toUpperCase());
-  const esParteDeMiPropiaCuenta = P => propios.some(pr=>pr && P.includes(pr));
-  let huboPropio = false;
-  for (const p of partes){
-    const P = p.toUpperCase();
-    if (esParteDeMiPropiaCuenta(P)){ huboPropio = true; continue; }
-    if (/[A-ZÁÉÍÓÚÑ]{3}/.test(P) && !GEN.some(g=>P.includes(g)) && !P.startsWith('ABONO') && !P.startsWith('PAGO '))
-      return {tipo:'comercio', clave: p.replace(/\s+ES\d{2}.*$/,'').slice(0,34).trim()};
-  }
-  if (huboPropio) return {tipo:'traspaso', clave:'Traspaso entre cuentas propias'};
-  if (partes.some(p=>p.toUpperCase().startsWith('CUOTA T'))) return {tipo:'comercio', clave:'CUOTA TARJETA'};
-  return {tipo:'comercio', clave:'Compra con tarjeta sin comercio'};
-}
-
-function claveValida(k, R){
-  const kk = k.trim().toLowerCase();
-  if (kk.length < 4) return {ok:false, motivo:'La clave necesita al menos 4 caracteres.'};
-  if ((R.clavesProhibidas||[]).some(p=>kk.includes(p))) return {ok:false, motivo:'Clave demasiado genérica: contiene un término prohibido.'};
-  if (/^\d+$/.test(kk)) return {ok:false, motivo:'Una clave solo numérica no identifica un comercio.'};
-  return {ok:true, clave:kk};
-}
-</script>
-
-<script>
-/* ============ ESTADO Y PERSISTENCIA ============ */
-let DB=null, MOVS=[], CATS=[], REGLAS=null, META=null;
-let vista='resumen', mesSel=null, grupoAbierto=null, filtroCat='', filtroTxt='', presuMes=null;
-
-/* ---- Firebase ---- */
-const firebaseConfig = {
-  apiKey: "AIzaSyBfGpcUK8YAk-dX_TM-8DjLyGI0XeJCLEI",
-  authDomain: "economia-casa-68ef4.firebaseapp.com",
-  projectId: "economia-casa-68ef4",
-  storageBucket: "economia-casa-68ef4.firebasestorage.app",
-  messagingSenderId: "301476870545",
-  appId: "1:301476870545:web:0d8ed9d7392ad8d8f04230"
-};
-firebase.initializeApp(firebaseConfig);
-// Manifest PWA generado en runtime (evita problemas de codificación en data-URI) para poder "instalar" la app
-(function(){
-  const icon = "data:image/svg+xml,"+encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='#5B6EE8'/><path d='M28 46 L50 28 L72 46 V72 H28 Z' fill='none' stroke='white' stroke-width='5' stroke-linejoin='round'/><text x='50' y='66' font-size='26' font-family='Georgia,serif' fill='white' text-anchor='middle' font-weight='bold'>€</text></svg>`);
-  const manifest = {
-    name:'Economía de casa', short_name:'Economía', start_url:'.', display:'standalone',
-    background_color:'#F7F8FC', theme_color:'#5B6EE8',
-    icons:[{src:icon, sizes:'any', type:'image/svg+xml', purpose:'any'}]
-  };
-  const blob = new Blob([JSON.stringify(manifest)], {type:'application/manifest+json'});
-  const link = document.createElement('link'); link.rel='manifest'; link.href=URL.createObjectURL(blob);
-  document.head.appendChild(link);
-})();
-const AUTH = firebase.auth();
-const FS = firebase.firestore();
-// Caché offline (compat SDK). El aviso de deprecación en consola es inofensivo.
-FS.enablePersistence({synchronizeTabs:true}).catch(()=>{});
-let UID = null;
-
-const catById = id => CATS.find(c=>c.id===id);
-const LS = { cats:'eco.categorias.v1', reglas:'eco.reglas.v1', meta:'eco.meta.v1' };
-
-/* IndexedDB actúa como caché local de movimientos (arranque instantáneo y offline) */
-function abrirDB(){
-  return new Promise((res,rej)=>{
-    const rq = indexedDB.open('economia-casa',1);
-    rq.onupgradeneeded = e => {
-      const db = e.target.result;
-      const st = db.createObjectStore('mov',{keyPath:'id'});
-      st.createIndex('ym','ym');
-    };
-    rq.onsuccess = e => res(e.target.result);
-    rq.onerror = () => rej(rq.error);
-  });
-}
-function cacheGetAll(){
-  return new Promise((res,rej)=>{
-    const rq = DB.transaction('mov').objectStore('mov').getAll();
-    rq.onsuccess=()=>res(rq.result); rq.onerror=()=>rej(rq.error);
-  });
-}
-function cachePut(movs){
-  return new Promise((res,rej)=>{
-    const tx = DB.transaction('mov','readwrite'); const st = tx.objectStore('mov');
-    for (const m of movs) st.put(m);
-    tx.oncomplete=res; tx.onerror=()=>rej(tx.error);
-  });
-}
-function cacheClear(){
-  return new Promise((res,rej)=>{
-    const tx=DB.transaction('mov','readwrite'); tx.objectStore('mov').clear();
-    tx.oncomplete=res; tx.onerror=()=>rej(tx.error);
-  });
-}
-
-/* Adaptador: escribe en Firestore (batch por lotes) y refleja en la caché local */
-async function dbPutAll(movs){
-  if (!movs.length) return;
-  await cachePut(movs);
-  const col = FS.collection('movimientos');
-  for (let i=0;i<movs.length;i+=400){
-    const batch = FS.batch();
-    for (const m of movs.slice(i,i+400)) batch.set(col.doc(fsId(m.id)), m);
-    await batch.commit();
-  }
-}
-async function dbGetAll(){ return await cacheGetAll(); }  // se lee de caché; Firestore sincroniza aparte
-async function dbClear(){
-  await cacheClear();
-  const snap = await FS.collection('movimientos').get();
-  for (let i=0;i<snap.docs.length;i+=400){
-    const batch = FS.batch();
-    for (const d of snap.docs.slice(i,i+400)) batch.delete(d.ref);
-    await batch.commit();
-  }
-}
-/* IDs de movimiento llevan '|', '#' y '/', no válidos como ID de documento Firestore: se codifican */
-function fsId(id){ return encodeURIComponent(id).replace(/\./g,'%2E'); }
-
-let escuchaMovs=null, escuchaConfig=null, importando=false, primerSnapshot=true;
-let renderPend=null;
-function renderDebounced(){ clearTimeout(renderPend); renderPend=setTimeout(()=>{ if(!importando) render(); }, 120); }
-
-/* Listener en vivo de movimientos: arranque desde caché + sincronización en tiempo real con la nube */
-function escucharMovimientos(){
-  if (escuchaMovs) escuchaMovs();
-  escuchaMovs = FS.collection('movimientos').onSnapshot(snap=>{
-    MOVS = snap.docs.map(d=>d.data());
-    // refresca la caché local para que el próximo arranque sin conexión esté al día
-    cacheClear().then(()=>{ if(MOVS.length) cachePut(MOVS); });
-    actualizarEstadoRed();
-    if (!primerSnapshot || !importando) renderDebounced();
-    primerSnapshot=false;
-  }, err=>{ console.error(err); actualizarEstadoRed(); });
-}
-
-/* El estado de conexión se toma de la red real del navegador, no del origen del snapshot
-   (Firestore sirve la caché en el primer snapshot aunque haya conexión). */
-function actualizarEstadoRed(){
-  bannerSync(navigator.onLine ? '' : 'Sin conexión · usando datos locales, se sincronizará al reconectar');
-}
-window.addEventListener('online', actualizarEstadoRed);
-window.addEventListener('offline', actualizarEstadoRed);
-
-/* Listener en vivo de la configuración compartida (presupuesto, reglas, metadatos) */
-function escucharConfig(){
-  if (escuchaConfig) escuchaConfig();
-  const refs = ['config/categorias','config/reglas','config/meta'];
-  const unsubs = refs.map(path => FS.doc(path).onSnapshot(doc=>{
-    if (!doc.exists || doc.metadata.hasPendingWrites) return; // ignora ecos de escrituras propias
-    const v = doc.data().v;
-    if (path.endsWith('categorias')) CATS = v;
-    else if (path.endsWith('reglas')) REGLAS = v;
-    else META = v;
-    renderDebounced();
-  }));
-  escuchaConfig = ()=>unsubs.forEach(u=>u());
-}
-function bannerSync(txt){ const b=document.getElementById('sync'); b.textContent=txt; b.style.display=txt?'block':'none'; }
-
-let seedActualizada = false;
-async function cargarConfig(){
-  // Config compartida vive en Firestore: config/categorias, config/reglas, config/meta
-  let cfgCat=null, cfgReg=null, cfgMeta=null;
-  try {
-    const [c,r,m] = await Promise.all([
-      FS.doc('config/categorias').get(), FS.doc('config/reglas').get(), FS.doc('config/meta').get()
-    ]);
-    if (c.exists) cfgCat = c.data().v;
-    if (r.exists) cfgReg = r.data().v;
-    if (m.exists) cfgMeta = m.data().v;
-  } catch(e){ /* offline: se cae a valores locales/semilla */ }
-
-  CATS = cfgCat || JSON.parse(localStorage.getItem(LS.cats)||'null') || SEED.categorias.map(c=>({...c}));
-  REGLAS = cfgReg || JSON.parse(localStorage.getItem(LS.reglas)||'null') || JSON.parse(JSON.stringify(SEED.reglas));
-  META = cfgMeta || JSON.parse(localStorage.getItem(LS.meta)||'null') || {schemaVersion:SEED.schemaVersion, cuenta:null, ultimaImportacion:null, seedRev:0};
-
-  // fusiona novedades de la semilla pública sin pisar lo aprendido
-  if ((SEED.seedRev||1) > (META.seedRev||0)){
-    for (const k in SEED.reglas.comercios) if (!(k in REGLAS.comercios)) REGLAS.comercios[k]=SEED.reglas.comercios[k];
-    const tienen = new Set(REGLAS.palabrasClave.flatMap(([,kws])=>kws));
-    for (const [cat,kws] of SEED.reglas.palabrasClave){
-      const nuevas = kws.filter(k=>!tienen.has(k));
-      if (nuevas.length){
-        const ex = REGLAS.palabrasClave.find(r=>r[0]===cat);
-        if (ex) ex[1].push(...nuevas); else REGLAS.palabrasClave.push([cat,nuevas]);
-      }
-    }
-    for (const c of SEED.categorias) if (!CATS.find(x=>x.id===c.id)) CATS.push({...c});
-    for (const campo of ['cuentasAhorro','cuentasPropias','nombresPropios','clavesProhibidas'])
-      REGLAS[campo] = [...new Set([...(REGLAS[campo]||[]), ...(SEED.reglas[campo]||[])])];
-    META.seedRev = SEED.seedRev; seedActualizada = true;
-  }
-
-  // Primer arranque: cargar los datos privados (nombres/cuentas) que no van en el código
-  if (!META.privadosCargados && typeof DATOS_PRIVADOS !== 'undefined' && DATOS_PRIVADOS){
-    Object.assign(REGLAS.comercios, DATOS_PRIVADOS.comercios||{});
-    for (const campo of ['cuentasAhorro','cuentasPropias','nombresPropios'])
-      REGLAS[campo] = [...new Set([...(REGLAS[campo]||[]), ...((DATOS_PRIVADOS[campo])||[])])];
-    for (const [cat,kws] of (DATOS_PRIVADOS.palabrasClave||[])){
-      const ex = REGLAS.palabrasClave.find(r=>r[0]===cat);
-      if (ex) ex[1].push(...kws.filter(k=>!ex[1].includes(k))); else REGLAS.palabrasClave.push([cat,kws]);
-    }
-    META.privadosCargados = true; seedActualizada = true;
-  }
-  if (seedActualizada) await guardarConfig();
-}
-async function guardarConfig(){
-  localStorage.setItem(LS.cats, JSON.stringify(CATS));
-  localStorage.setItem(LS.reglas, JSON.stringify(REGLAS));
-  localStorage.setItem(LS.meta, JSON.stringify(META));
-  try {
-    await Promise.all([
-      FS.doc('config/categorias').set({v:CATS}),
-      FS.doc('config/reglas').set({v:REGLAS}),
-      FS.doc('config/meta').set({v:META})
-    ]);
-  } catch(e){ /* offline: quedará en local y subirá al reconectar vía próxima escritura */ }
-}
-
-function flujoDe(catId){ const c=catById(catId); return c && c.tipo==='interno' ? 'interno' : 'real'; }
-
-/* ---- Presupuesto: calculado vs ajustado, con override opcional por mes concreto ---- */
-// Plan efectivo de una categoría. Si se pasa ym y hay un override para ese mes, manda el override.
-function planEfectivo(c, ym){
-  if (ym && META.overrides && META.overrides[ym] && META.overrides[ym][c.id]!=null){
-    return META.overrides[ym][c.id];
-  }
-  if (c.planManual!=null) return c.planManual;
-  if (c.planCalc!=null) return c.planCalc;
-  return c.planMes!=null ? c.planMes : 0; // compatibilidad con datos antiguos
-}
-// ¿tiene override este mes/categoría?
-function tieneOverride(catId, ym){ return !!(META.overrides && META.overrides[ym] && META.overrides[ym][catId]!=null); }
-// Recalcula planCalc de cada categoría de gasto desde los últimos 12 meses de movimientos.
-// mediana: mediana de los totales mensuales (gastos estables). anualizado: total 12m / 12 (gastos irregulares).
-// ventana de los 12 meses cerrados que se usa como base para todos los cálculos de plan
-// (gastos, ingresos y flujos internos), reutilizable fuera de recalcularPlanes
-function ventanaBase(){
-  const ms = meses();
-  if (!ms.length) return [];
-  const idxUlt = ms.length-1;
-  const ventana = ms.slice(Math.max(0, idxUlt-12), idxUlt); // 12 meses cerrados anteriores al último
-  const usar = ventana.length>=6 ? ventana : ms.slice(0, idxUlt).slice(-12); // fallback si hay poco histórico
-  return usar.length ? usar : ms;
-}
-function mediana(arr){
-  const orden = [...arr].sort((a,b)=>a-b);
-  const mid = Math.floor(orden.length/2);
-  return orden.length%2 ? orden[mid] : (orden[mid-1]+orden[mid])/2;
-}
-function recalcularPlanes(){
-  const base = ventanaBase();
-  if (!base.length) return 0;
-  // acumula neto por categoría y mes (gasto/interno = suma de -importe, positivo si sale de
-  // la cuenta; ingreso = suma de +importe)
-  const porCatMes = {};
-  for (const m of MOVS){
-    if (!base.includes(m.ym)) continue;
-    const c = catById(m.categoriaId);
-    if (!c || (c.tipo!=='gasto' && c.tipo!=='ingreso' && c.tipo!=='interno')) continue;
-    (porCatMes[c.id] = porCatMes[c.id] || {});
-    const signo = c.tipo==='ingreso' ? 1 : -1;
-    porCatMes[c.id][m.ym] = (porCatMes[c.id][m.ym]||0) + (signo*m.importe);
-  }
-  let n=0;
-  for (const c of CATS){
-    if (c.tipo!=='gasto' && c.tipo!=='ingreso' && c.tipo!=='interno') continue;
-    const serie = base.map(ym => (porCatMes[c.id] && porCatMes[c.id][ym]) || 0);
-    const val = c.metodoBase==='anualizado'
-      ? serie.reduce((a,b)=>a+b,0) / base.length   // media mensual (suave para irregulares)
-      : mediana(serie);
-    c.planCalc = Math.round(val);
-    n++;
-  }
-  return n;
-}
-// referencia histórica de cuánto SALE y cuánto ENTRA en una categoría de flujo interno
-// (mediana mensual sobre la misma ventana de 12 meses que usa el plan calculado). Es solo
-// informativo, para entender de qué se compone el neto ajustable de esa categoría.
-function historicoSalidaEntrada(catId){
-  const base = ventanaBase();
-  if (!base.length) return {sale:0, entra:0};
-  const porMesSale={}, porMesEntra={};
-  for (const m of MOVS){
-    if (m.categoriaId!==catId || !base.includes(m.ym)) continue;
-    if (m.importe<0) porMesSale[m.ym] = (porMesSale[m.ym]||0) + (-m.importe);
-    else porMesEntra[m.ym] = (porMesEntra[m.ym]||0) + m.importe;
-  }
-  const sale = mediana(base.map(ym=>porMesSale[ym]||0));
-  const entra = mediana(base.map(ym=>porMesEntra[ym]||0));
-  return {sale:r2(sale), entra:r2(entra)};
-}
-
-/* Previsión del mes: previsto (plan vigente) vs real, en ingresos, gastos y balance */
-function previsionMes(ym){
-  const R = resumenMes(ym);
-  const gastoPrev = CATS.filter(c=>c.tipo==='gasto').reduce((s,c)=>s+planEfectivo(c,ym),0);
-  const ingPrev   = CATS.filter(c=>c.tipo==='ingreso').reduce((s,c)=>s+planEfectivo(c,ym),0);
-  const internoPrev = CATS.filter(c=>c.tipo==='interno').reduce((s,c)=>s+planEfectivo(c,ym),0);
-  // desglose por categoría de gasto: previsto vs real del mes
-  const catGasto = CATS.filter(c=>c.tipo==='gasto').map(c=>({
-    id:c.id, nombre:c.nombre, grupo:c.grupo,
-    prev: planEfectivo(c,ym),
-    real: r2(R.porCat[c.id]||0),
-    manual: c.planManual!=null, override: tieneOverride(c.id,ym)
-  })).filter(x=>x.prev>0 || x.real>0);
-  return {
-    ing:{prev:r2(ingPrev), real:R.ingReal},
-    gasto:{prev:r2(gastoPrev), real:R.gasReal},
-    balance:{prev:r2(ingPrev-gastoPrev-internoPrev), real:R.balance},
-    catGasto
-  };
-}
-// progreso del mes en curso: fracción de días transcurridos (para "ritmo esperado")
-function fraccionMes(ym){
-  const hoy = new Date();
-  const [y,m] = ym.split('-').map(Number);
-  const diasMes = new Date(y, m, 0).getDate();
-  if (y<hoy.getFullYear() || (y===hoy.getFullYear() && m<hoy.getMonth()+1)) return 1; // mes pasado, completo
-  if (y>hoy.getFullYear() || (y===hoy.getFullYear() && m>hoy.getMonth()+1)) return 0; // mes futuro
-  return hoy.getDate()/diasMes; // mes en curso
-}
-
-
-function aplicarCategoria(mov){
-  const r = categorizar(mov, REGLAS);
-  if (r){ mov.categoriaId=r.cat; mov.via=r.via; mov.flujo=flujoDe(r.cat); }
-  else { mov.categoriaId=null; mov.via=null; mov.flujo='real'; }
-  mov.revisado = mov.revisado||false;
-  return mov;
-}
-
-/* ============ IMPORTACIÓN ============ */
-async function importarFichero(file){
-  importando=true;
-  try{
-  const buf = await file.arrayBuffer();
-  const wb = XLSX.read(buf,{cellDates:true});
-  const sheet = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(sheet,{header:1,raw:true,defval:null});
-  const det = detectarFormato(rows);
-  if (!det) return {error:'No reconozco el formato. Espero el extracto completo (TT) o el fichero de Movimientos de cuenta.'};
-  const parsed = det.formato==='TT' ? parseTT(rows,det.headerIdx) : parseMC(rows,det.headerIdx);
-  const porId = new Map(MOVS.map(m=>[m.id,m]));
-  let nuevos=0, dups=0, enriquecidos=0; const aGuardar=[];
-  for (const m of parsed.movs){
-    m.ym = m.fecha.slice(0,7);
-    const ex = porId.get(m.id);
-    if (!ex){
-      aplicarCategoria(m); m.nota=''; aGuardar.push(m); porId.set(m.id,m); nuevos++;
-    } else if (m.raw.formato==='TT' && ex.raw.formato==='MC'){
-      ex.descripcion=m.descripcion; ex.raw=m.raw;
-      if (ex.via!=='manual') aplicarCategoria(ex);
-      aGuardar.push(ex); enriquecidos++;
-    } else dups++;
-  }
-  if (aGuardar.length){ await dbPutAll(aGuardar); MOVS=[...porId.values()]; }
-  if (parsed.cuenta && !META.cuenta){ META.cuenta=parsed.cuenta; }
-  META.ultimaImportacion=new Date().toISOString(); await guardarConfig();
-  const sinCat = parsed.movs.filter(m=>porId.get(m.id).categoriaId===null).length;
-  return {formato:det.formato, total:parsed.movs.length, nuevos, dups, enriquecidos, sinCat};
-  } finally { importando=false; }
-}
-
-/* ============ CONSULTAS ============ */
-const meses = () => [...new Set(MOVS.map(m=>m.ym))].sort();
-const movsMes = ym => MOVS.filter(m=>m.ym===ym);
-function resumenMes(ym){
-  const ms = movsMes(ym);
-  let ingReal=0, gasReal=0, intIn=0, intOut=0;
-  const porGrupo={}, porCat={}, porIng={};
-  for (const m of ms){
-    const c = catById(m.categoriaId);
-    const tipo = c ? c.tipo : (m.importe>0 ? 'ingreso' : 'gasto'); // sin categoría: + = ingreso, − = gasto
-    if (tipo==='interno'){ if(m.importe>0) intIn+=m.importe; else intOut+=-m.importe; continue; }
-    if (tipo==='ingreso'){
-      ingReal += m.importe;
-      const iid = m.categoriaId||'__ingsc';
-      porIng[iid]=(porIng[iid]||0)+m.importe;
-      continue;
-    }
-    // gasto (o sin clasificar en negativo): el importe se suma con signo, así un reembolso (+) resta del grupo
-    const gastoNeto = -m.importe;
-    gasReal += gastoNeto;
-    const g = c ? c.grupo : 'Sin clasificar';
-    porGrupo[g]=(porGrupo[g]||0)+gastoNeto;
-    const cid = m.categoriaId||'__null';
-    porCat[cid]=(porCat[cid]||0)+gastoNeto;
-  }
-  return {ingReal:r2(ingReal), gasReal:r2(gasReal), intIn:r2(intIn), intOut:r2(intOut),
-    balance:r2(ingReal-gasReal-(intOut-intIn)), porGrupo, porCat, porIng, n:ms.length};
-}
-const enBandeja = m => m.categoriaId===null || (m.categoriaId==='bizum_env' && !m.revisado);
-const bandeja = () => MOVS.filter(enBandeja).sort((a,b)=>b.fecha.localeCompare(a.fecha));
-
-function descCorta(m){
-  const p = (m.descripcion||'').split('|').map(s=>s.trim()).filter(Boolean);
-  const conLetras = p.find(s=>/[A-Za-zÁÉÍÓÚÑáéíóúñ]{3}/.test(s));
-  return conLetras || p[0] || '(sin descripción)';
-}
-
-/* ============ VISTAS ============ */
-const $ = s => document.querySelector(s);
-function render(){
-  try{
-    renderNav();
-    ({resumen:vResumen, movimientos:vMovs, analisis:vAnalisis, simulador:vSimulador, presupuesto:vPresupuesto, bandeja:vBandeja, importar:vImportar, ajustes:vAjustes})[vista]();
-  }catch(err){
-    $('#main').innerHTML = `<div class="card"><strong>Algo ha fallado al pintar esta vista.</strong>
-      <div class="micro muted" style="margin-top:6px">Haz una captura de este mensaje para poder arreglarlo:</div>
-      <div class="tiny mono" style="margin-top:6px;word-break:break-word;color:var(--gasto)">${esc(err.message)}\n${esc((err.stack||'').split('\n').slice(0,3).join(' · '))}</div>
-      <button class="btn sec" style="margin-top:10px" onclick="vista='resumen';render()">Volver al resumen</button></div>`;
-  }
-}
-
-const ICON_GRUPO = {
-  'Alimentación':'🛒','Restauración y ocio':'🍽️','Vivienda':'🏠','Transporte y coche':'🚗',
-  'Niños':'🧸','Personal y salud':'💊','Compras':'🛍️','Finanzas e impuestos':'🏦',
-  'Efectivo':'💶','Otros':'📦','Sin clasificar':'❓','Flujos internos':'🔄','Ingresos':'💼'
-};
-const iconoGrupo = g => ICON_GRUPO[g] || '📦';
-
-const ICONS = {
-  resumen:'<svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>',
-  movimientos:'<svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>',
-  analisis:'<svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>',
-  presupuesto:'<svg viewBox="0 0 24 24"><path d="M4 5h16v14H4zM4 10h16M9 15h6"/></svg>',
-  bandeja:'<svg viewBox="0 0 24 24"><path d="M4 13l3 5h10l3-5M4 13V6h16v7M4 13h5l1.5 2h3L15 13h5"/></svg>',
-  importar:'<svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 19h16"/></svg>',
-  ajustes:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2"/></svg>',
-  mas:'<svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>'
-};
-const NAV_LABEL = {resumen:'Resumen', movimientos:'Movim.', analisis:'Análisis', presupuesto:'Presup.', bandeja:'Bandeja', importar:'Importar', ajustes:'Ajustes', mas:'Más'};
-const NAV_PRINCIPAL = ['resumen','movimientos','analisis','presupuesto','mas'];
-const NAV_MAS = ['bandeja','importar','ajustes'];
-function renderNav(){
-  const nb = bandeja().length;
-  // "Más" muestra punto si hay algo pendiente en bandeja
-  $('#nav').innerHTML = NAV_PRINCIPAL.map(v=>{
-    const activo = v===vista || (v==='mas' && NAV_MAS.includes(vista)) || (v==='analisis' && vista==='simulador');
-    const badge = v==='mas' && nb ? `<span class="badge">${nb>99?'99+':nb}</span>` : '';
-    return `<button class="${activo?'on':''}" onclick="${v==='mas'?'abrirMas()':`irA('${v}')`}"><span class="navic">${ICONS[v]}</span>${NAV_LABEL[v]}${badge}</button>`;
-  }).join('');
-  $('#hdr-cuenta').textContent = META.cuenta ? '···'+META.cuenta.replace(/\s/g,'').slice(-4) : '';
-}
-function abrirMas(){
-  const nb = bandeja().length;
-  const items = NAV_MAS.map(v=>{
-    const badge = v==='bandeja'&&nb?` <span class="pill rev">${nb}</span>`:'';
-    return `<button class="mas-item" onclick="cerrarMas();irA('${v}')"><span class="mas-ic">${ICONS[v]}</span><span>${NAV_LABEL[v]}${badge}</span><span class="mas-fl">›</span></button>`;
-  }).join('');
-  const velo = document.getElementById('velo');
-  const hoja = document.getElementById('hoja');
-  hoja.innerHTML = `<h3>Más opciones</h3><div class="mas-lista">${items}</div>`;
-  velo.style.display='block'; hoja.style.display='block';
-}
-function cerrarMas(){ document.getElementById('velo').style.display='none'; document.getElementById('hoja').style.display='none'; }
-function irA(v){
-  if (v==='movimientos' && vista!=='movimientos'){ filtroCat=''; filtroTxt=''; }
-  vista=v; render(); window.scrollTo(0,0);
-}
-
-function vResumen(){
-  const ms = meses();
-  if (!ms.length){ $('#main').innerHTML = `<div class="vacio">Aún no hay movimientos.<br>Empieza importando un extracto en la pestaña Importar.</div>`; return; }
-  if (!mesSel || !ms.includes(mesSel)) mesSel = ms[ms.length-1];
-  // asegura planes calculados (incluye ingresos) para poder mostrar la previsión
-  if (MOVS.length && CATS.some(c=>(c.tipo==='gasto'||c.tipo==='ingreso'||c.tipo==='interno') && c.planCalc==null)){
-    recalcularPlanes(); guardarConfig();
-  }
-  const idx = ms.indexOf(mesSel);
-  const R = resumenMes(mesSel);
-  const balance = R.balance; // ya descuenta lo traspasado a otras cuentas propias: esta cuenta se queda sin ese dinero
-  const netoInterno = r2(R.intOut - R.intIn); // positivo = ha salido más de lo que ha vuelto
-  const tasa = R.ingReal>0 ? Math.round(balance/R.ingReal*100) : null;
-
-  // cinta: destino de los ingresos del mes (gasto + traspasos + lo que queda de balance)
-  const total = Math.max(R.ingReal, R.gasReal + Math.max(netoInterno,0) + Math.max(balance,0), 1);
-  const wGas = R.gasReal/total*100, wTra = Math.max(netoInterno,0)/total*100, wBal = Math.max(balance,0)/total*100;
-  const grupos = Object.entries(R.porGrupo).sort((a,b)=>b[1]-a[1]);
-  const paleta = ['#A6432D','#C0623F','#CE8155','#D99E72','#E2B891','#EAD1B4','#D6C8A8','#BFB89A'];
-  let ci=0;
-  const segs = grupos.map(([g,v])=>`<div style="width:${v/total*100}%;background:${paleta[Math.min(ci++,paleta.length-1)]}" title="${esc(g)} ${fmtEUR(v)}"></div>`).join('');
-
-  const planPorGrupo={};
-  for (const c of CATS){ if (c.tipo==='gasto'){ const p=planEfectivo(c,mesSel); if(p) planPorGrupo[c.grupo]=(planPorGrupo[c.grupo]||0)+p; } }
-
-  $('#main').innerHTML = `
-    <div class="mespicker">
-      <button onclick="cambiaMes(-1)" ${idx===0?'disabled':''} aria-label="Mes anterior">‹</button>
-      <span class="mes">${fmtYM(mesSel)}</span>
-      <button onclick="cambiaMes(1)" ${idx===ms.length-1?'disabled':''} aria-label="Mes siguiente">›</button>
-    </div>
-    <div class="kpis">
-      <div class="kpi"><div class="ic" style="background:var(--ingreso-bg)"><svg style="stroke:var(--ingreso)" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg></div><div class="lbl">Ingresos</div><div class="val pos">${fmtEUR(R.ingReal)}</div></div>
-      <div class="kpi"><div class="ic" style="background:var(--gasto-bg)"><svg style="stroke:var(--gasto)" viewBox="0 0 24 24"><path d="M12 5v14M5 12l7 7 7-7"/></svg></div><div class="lbl">Gasto real</div><div class="val neg">${fmtEUR(R.gasReal)}</div></div>
-      <div class="kpi"><div class="ic" style="background:var(--marca-bg)"><svg style="stroke:var(--marca)" viewBox="0 0 24 24"><path d="M3 12h18M12 3v18"/></svg></div><div class="lbl">Balance</div><div class="val" style="color:var(--marca)">${fmtEUR(balance)}</div><div class="sub">${tasa!=null?tasa+'% de ahorro':''}</div></div>
-    </div>
-    ${htmlComposicionBalance(R, balance, netoInterno)}
-    ${htmlComparativaGasto(mesSel)}
-    ${htmlPrevision(mesSel)}
-    ${htmlAvisos(mesSel)}
-    <div class="card">
-      <div class="row"><span class="micro muted">En qué se convierte el mes</span><span class="micro muted mono">${fmtEUR(total)}</span></div>
-      <div class="cinta">${segs}${wTra>0?`<div style="width:${wTra}%;background:var(--interno)" title="Traspasos a otras cuentas propias ${fmtEUR(netoInterno)}"></div>`:''}${wBal>0?`<div style="width:${wBal}%;background:var(--ingreso)" title="Balance ${fmtEUR(balance)}"></div>`:''}</div>
-      <div class="leyenda">
-        ${grupos.slice(0,4).map(([g],i)=>`<span><span class="dot" style="background:${paleta[i]}"></span>${esc(g)}</span>`).join('')}
-        ${wTra>0?`<span><span class="dot" style="background:var(--interno)"></span>Traspasos</span>`:''}
-        ${balance>0?`<span><span class="dot" style="background:var(--ingreso)"></span>Balance</span>`:''}
-      </div>
-    </div>
-    <h2 class="seccion">Gasto por grupo</h2>
-    ${grupos.map(([g,v])=>{
-      const sinClas = g==='Sin clasificar';
-      const plan = planPorGrupo[g]||0;
-      const pct = plan? Math.min(v/plan*100,100) : 100;
-      const color = sinClas? 'var(--plan)' : !plan? 'var(--interno)' : v<=plan? 'var(--ingreso)' : 'var(--gasto)';
-      const abierto = grupoAbierto===g;
-      const cats = abierto ? Object.entries(R.porCat).map(([cid,cv])=>({c:catById(cid),cv,cid}))
-        .filter(x=>(x.c?x.c.grupo:'Sin clasificar')===g).sort((a,b)=>b.cv-a.cv) : [];
-      if (sinClas) return `<div class="card grupo" onclick="irA('bandeja')">
-        <div class="row"><span class="gnom"><span class="gic" style="background:var(--plan-bg)">❓</span>Sin clasificar <span class="pill rev">revisar</span></span><span class="mono">${fmtEUR(v)}</span></div>
-        <div class="barra"><div class="fill" style="width:100%;background:var(--plan)"></div></div>
-        <div class="tiny muted" style="margin-top:8px">Este importe cuenta en el gasto del mes pero aún no tiene categoría. Toca para revisarlo en la bandeja.</div>
-      </div>`;
-      return `<div class="card grupo ${abierto?'abierto':''}" onclick="toggleGrupo('${esc(g)}')">
-        <div class="row"><span class="gnom"><span class="gic">${iconoGrupo(g)}</span>${esc(g)}</span><span class="mono">${fmtEUR(v)}${plan?` <span class="micro muted">/ ${fmtEUR(plan)}</span>`:''}</span></div>
-        <div class="barra"><div class="fill" style="width:${pct}%;background:${color}"></div>${plan&&v>plan?'':plan?`<div class="marca" style="left:calc(100% - 2px)"></div>`:''}</div>
-        ${abierto?`<div class="catlist">${cats.map(x=>`<div class="catrow" onclick="event.stopPropagation();verCategoria('${x.cid}')"><span>${esc(x.c?x.c.nombre:'Sin clasificar')}</span><span class="mono">${fmtEUR(x.cv)}</span></div>`).join('')}</div>`:''}
-      </div>`;
-    }).join('')}
-    ${htmlIngresos(R)}
-    ${htmlFlujosInternos(mesSel)}
-  `;
-}
-// El Balance ya descuenta lo traspasado a otras cuentas propias (esta cuenta se queda sin ese
-// dinero, sea cual sea su destino). Esta tarjeta solo explica de qué se compone esa cifra,
-// para que no parezca que "falta" dinero por explicar.
-function htmlComposicionBalance(R, balance, netoInterno){
-  if (Math.abs(netoInterno) < 1) return '';
-  const ingMenosGasto = r2(R.ingReal - R.gasReal);
-  return `<div class="card" style="padding:12px 14px">
-    <div class="micro muted">Cómo se compone tu Balance</div>
-    <div class="row" style="margin-top:8px"><span class="tiny muted">Ingresos − gasto real</span><span class="mono">${fmtEUR(ingMenosGasto)}</span></div>
-    <div class="row" style="margin-top:3px"><span class="tiny muted">${netoInterno>=0?'− traspasado':'+ recuperado'} a otras cuentas propias</span><span class="mono ${netoInterno>=0?'neg':'pos'}">${netoInterno>=0?'-':'+'}${fmtEUR(Math.abs(netoInterno))}</span></div>
-    <div class="row" style="margin-top:6px;padding-top:8px;border-top:1px solid var(--line)"><span class="micro"><strong>Balance</strong></span><span class="mono" style="font-weight:600;color:var(--marca)">${fmtEUR(balance)}</span></div>
-    <p class="tiny muted" style="margin:8px 0 0">Esta cuenta se queda sin el dinero que traspasas, aunque siga siendo tuyo en otra cuenta — por eso el Balance ya lo tiene descontado.</p>
-  </div>`;
-}
-// Comparativa sencilla: gasto de este mes vs el anterior, con una mini-tendencia de los últimos meses
-function htmlComparativaGasto(ym){
-  const ms = meses();
-  const idx = ms.indexOf(ym);
-  const gastoMes = resumenMes(ym).gasReal;
-  const ymAnterior = idx>0 ? ms[idx-1] : null;
-  if (!ymAnterior){
-    return `<div class="card">
-      <div class="micro muted">Gasto este mes</div>
-      <div class="serif" style="font-size:20px;font-weight:600;margin-top:2px">${fmtEUR(gastoMes)}</div>
-      <div class="tiny muted" style="margin-top:2px">Aún no hay un mes anterior con el que comparar.</div>
-    </div>`;
-  }
-  const gastoAnterior = resumenMes(ymAnterior).gasReal;
-  const diff = r2(gastoMes - gastoAnterior);
-  const pct = gastoAnterior>0 ? Math.round(diff/gastoAnterior*100) : null;
-  const peor = diff>0; // más gasto que el mes anterior
-  // tendencia: hasta 6 meses cerrados hasta el mes seleccionado (incluido)
-  const serieCompleta = serieMeses(6).filter(m=>ms.indexOf(m)<=idx);
-  const valores = serieCompleta.map(m=>resumenMes(m).gasReal);
-  const max = Math.max(...valores, 1);
-  const barras = serieCompleta.map((m,i)=>{
-    const h = Math.max(valores[i]/max*100, 4);
-    const esMesSel = m===ym;
-    return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px">
-      <div style="width:100%;height:36px;display:flex;align-items:flex-end">
-        <div style="width:100%;border-radius:3px 3px 0 0;height:${h}%;background:${esMesSel?'var(--gasto)':'var(--line)'}" title="${nombreMesCorto(m)}: ${fmtEUR(valores[i])}"></div>
-      </div>
-      <span class="tiny muted">${nombreMesCorto(m)}</span>
-    </div>`;
-  }).join('');
-  return `<div class="card">
-    <div class="row" style="align-items:baseline">
-      <span class="micro muted">Gasto este mes vs mes anterior</span>
-      <span class="micro mono ${peor?'neg':'pos'}">${diff>=0?'+':''}${fmtEUR(diff)}${pct!=null?` (${diff>=0?'+':''}${pct}%)`:''}</span>
-    </div>
-    <div class="row" style="margin-top:4px;align-items:baseline">
-      <span class="serif" style="font-size:20px;font-weight:600">${fmtEUR(gastoMes)}</span>
-      <span class="tiny muted">vs ${fmtEUR(gastoAnterior)} en ${nombreMesCorto(ymAnterior)}</span>
-    </div>
-    ${serieCompleta.length>1?`<div style="display:flex;gap:6px;margin-top:12px">${barras}</div>`:''}
-  </div>`;
-}
-// Desglose de ingresos del mes por origen, navegable a sus movimientos
-function htmlIngresos(R){
-  const items = Object.entries(R.porIng).map(([cid,v])=>({cid, v, c:catById(cid)}))
-    .sort((a,b)=>b.v-a.v);
-  if (!items.length) return '';
-  const max = Math.max(...items.map(x=>x.v), 1);
-  const iconoIng = c => c ? (c.id==='nomina'?'💼':c.id==='dev_tributaria'?'🧾':c.id==='bizum_rec'?'📲':'✨') : '✨';
-  return `<h2 class="seccion">Ingresos por origen</h2>
-    <div class="card">
-      ${items.map(x=>`<div class="grupo" onclick="verCategoria('${x.cid==='__ingsc'?'__ingsc':x.cid}')">
-        <div class="row"><span class="gnom"><span class="gic" style="background:var(--ingreso-bg)">${iconoIng(x.c)}</span>${esc(x.c?x.c.nombre:'Ingreso sin clasificar')}</span><span class="mono pos">${fmtEUR(x.v)}</span></div>
-        <div class="barra"><div class="fill" style="width:${x.v/max*100}%;background:var(--ingreso)"></div></div>
-      </div>`).join('')}
-    </div>`;
-}
-// Desglose de los flujos internos del mes (ahorro, traspasos entre cuentas propias,
-// devoluciones): no son gasto ni ingreso real, pero conviene poder ver cuánto sale y cuánto
-// entra en cada uno (no solo el neto) y comprobar que se han categorizado bien, con
-// navegación directa a sus movimientos.
-function htmlFlujosInternos(ym){
-  const porCat = {};
-  for (const m of movsMes(ym)){
-    const c = catById(m.categoriaId);
-    if (!c || c.tipo!=='interno') continue;
-    const e = (porCat[c.id] = porCat[c.id] || {sale:0, entra:0});
-    if (m.importe<0) e.sale += -m.importe; else e.entra += m.importe;
-  }
-  const items = Object.entries(porCat).map(([cid,v])=>({cid, sale:r2(v.sale), entra:r2(v.entra), neto:r2(v.entra-v.sale), c:catById(cid)}))
-    .sort((a,b)=>Math.max(b.sale,b.entra)-Math.max(a.sale,a.entra));
-  if (!items.length) return '';
-  const max = Math.max(...items.map(x=>Math.max(x.sale,x.entra)), 1);
-  const icono = c => c ? (c.id==='ahorro'?'🏦':c.id==='traspasos'?'🔄':c.id==='devoluciones'?'↩️':'🔁') : '🔁';
-  const R = resumenMes(ym);
-  return `<h2 class="seccion">Flujos internos <span class="tiny muted">(no cuentan como gasto)</span></h2>
-    <div class="card">
-      <p class="micro muted" style="margin-top:0">Ahorro y traspasos entre tus propias cuentas, y devoluciones de compra: no son gasto ni ingreso real (este mes: ingresos ${fmtEUR(R.ingReal)}, gasto ${fmtEUR(R.gasReal)}), pero sí están descontados del Balance, porque esta cuenta se queda sin ese dinero. Toca una categoría para ver sus movimientos.</p>
-      ${items.map(x=>`<div class="grupo" onclick="verCategoria('${x.cid}')">
-        <div class="row"><span class="gnom"><span class="gic" style="background:var(--interno-bg)">${icono(x.c)}</span>${esc(x.c?x.c.nombre:'Sin clasificar')}</span><span class="mono int">${x.neto>=0?'+':''}${fmtEUR(x.neto)}</span></div>
-        ${barraEntradaSalida(x.sale, x.entra, max)}
-        <div class="tiny muted" style="margin-top:4px">sale ${fmtEUR(x.sale)} · entra ${fmtEUR(x.entra)}</div>
-      </div>`).join('')}
-    </div>`;
-}
-let previsionAbierta = false;
-function togglePrevision(){ previsionAbierta = !previsionAbierta; render(); }
-// aviso compacto en el Resumen si hay recibos que han subido de precio
-let avisosAbierto = false;
-function verMovId(id){
-  const m = MOVS.find(x=>x.id===id); if(!m) return;
-  filtroCat=''; filtroTxt = conceptoDe(m).clave.toLowerCase(); vista='movimientos'; render(); window.scrollTo(0,0);
-}
-function toggleAvisos(){ avisosAbierto = !avisosAbierto; render(); }
-// Aviso unificado y discreto: una tira con el nº de avisos; al tocar despliega el detalle.
-function htmlAvisos(ym){
-  const suben = recurrentesConSubida();
-  const anom = anomalosMes(ym);
-  const total = suben.length + anom.length;
-  if (!total) return '';
-  const resumenTxt = [
-    suben.length ? `${suben.length} recibo${suben.length>1?'s':''} al alza` : '',
-    anom.length ? `${anom.length} gasto${anom.length>1?'s':''} alto${anom.length>1?'s':''}` : ''
-  ].filter(Boolean).join(' · ');
-  return `<div class="avisos ${avisosAbierto?'abierto':''}">
-    <div class="avisos-cab" onclick="toggleAvisos()">
-      <span class="avisos-izq"><span class="avisos-punto"></span><strong>${total} aviso${total>1?'s':''}</strong> <span class="muted micro">${resumenTxt}</span></span>
-      <span class="avisos-fl">${avisosAbierto?'▲':'▼'}</span>
-    </div>
-    ${avisosAbierto?`<div class="avisos-cuerpo">
-      ${suben.length?`<div class="aviso-grupo"><div class="aviso-tit">📈 Recibos que han subido</div>
-        ${suben.slice(0,5).map(r=>`<div class="catrow" onclick="verRecurrente('${esc(r.claveRaw)}')"><span>${esc(r.clave)}</span><span class="mono neg">+${Math.round(r.subidaPct)}% · ${fmtEUR(r.actual)}</span></div>`).join('')}
-        <div class="tiny muted" style="padding:4px 6px">Ver todos en Análisis › Gastos recurrentes</div></div>`:''}
-      ${anom.length?`<div class="aviso-grupo"><div class="aviso-tit">👀 Gastos altos este mes</div>
-        ${anom.slice(0,5).map(a=>`<div class="catrow" onclick="verMovId('${a.id}')"><span>${esc(a.concepto)} <span class="tiny muted">${a.veces}×</span></span><span class="mono neg">${fmtEUR(a.importe)}</span></div>`).join('')}</div>`:''}
-    </div>`:''}
-  </div>`;
-}
-
-// barra divergente compacta: sale (rojo, hacia la izquierda) vs entra (verde, hacia la derecha),
-// reutiliza las mismas clases que barraBalance para no añadir CSS nuevo
-function barraEntradaSalida(sale, entra, max){
-  const escala = v => Math.min((v/max)*50, 50);
-  const wSale = escala(sale), wEntra = escala(entra);
-  return `<div class="pbar pbar-bal">
-    <div class="pbar-cero"></div>
-    ${sale?`<div class="pbar-fill" style="left:${50-wSale}%;width:${wSale}%;background:var(--gasto);border-radius:6px 0 0 6px"></div>`:''}
-    ${entra?`<div class="pbar-fill" style="left:50%;width:${wEntra}%;background:var(--ingreso);border-radius:0 6px 6px 0"></div>`:''}
-  </div>`;
-}
-// barra previsto vs real. Para ingresos/gastos (siempre >=0) barra normal;
-// para balance (puede ser negativo) barra divergente centrada en cero.
-function barraPrev(prev, real, frac, esGasto){
-  const ritmoFrac = frac>0 && frac<1 ? frac : null;
-  // color: en mes en curso se juzga contra el ritmo esperado; en mes cerrado, contra el total
-  let color;
-  if (esGasto){
-    const umbral = ritmoFrac!=null ? prev*ritmoFrac : prev;
-    color = real<=umbral*1.02 ? 'var(--ingreso)' : (real<=prev ? 'var(--plan)' : 'var(--gasto)');
-  } else {
-    const umbral = ritmoFrac!=null ? prev*ritmoFrac : prev*0.98;
-    color = real>=umbral ? 'var(--ingreso)' : 'var(--plan)';
-  }
-  const max = Math.max(prev, real, 1)*1.08;
-  const wReal = Math.max(Math.min(real/max*100,100), real>0?1.5:0);
-  const posPrev = Math.min(prev/max*100,100);
-  const ritmo = ritmoFrac!=null ? Math.min((prev*ritmoFrac)/max*100,100) : null;
-  return `<div class="pbar">
-    <div class="pbar-fill" style="width:${wReal}%;background:${color}"></div>
-    ${ritmo!=null?`<div class="pbar-ritmo" style="left:${ritmo}%" title="ritmo de hoy"></div>`:''}
-    <div class="pbar-prev" style="left:${posPrev}%" title="previsto ${fmtEUR(prev)}"></div>
-  </div>`;
-}
-
-// barra divergente para el balance (centro = 0, izquierda negativo, derecha positivo)
-function barraBalance(prev, real, frac){
-  const mag = Math.max(Math.abs(prev), Math.abs(real), 1)*1.1;
-  const pos = v => 50 + (v/mag)*50; // 0 -> 50%
-  const color = real>=prev ? 'var(--ingreso)' : 'var(--gasto)';
-  const xReal = pos(real), xPrev = pos(prev);
-  const izq = Math.min(50, xReal), anch = Math.abs(xReal-50);
-  return `<div class="pbar pbar-bal">
-    <div class="pbar-cero"></div>
-    <div class="pbar-fill" style="left:${izq}%;width:${anch}%;background:${color};border-radius:${real<0?'6px 0 0 6px':'0 6px 6px 0'}"></div>
-    <div class="pbar-prev" style="left:${xPrev}%" title="previsto ${fmtEUR(prev)}"></div>
-  </div>`;
-}
-
-function htmlPrevision(ym){
-  const p = previsionMes(ym);
-  const frac = fraccionMes(ym);
-  const enCurso = frac>0 && frac<1;
-  const sinPrev = p.ing.prev===0 && p.gasto.prev===0;
-  if (sinPrev) return ''; // sin presupuesto configurado, no mostramos previsión
-
-  // desvío de balance
-  const desvBal = r2(p.balance.real - p.balance.prev);
-  const filaMain = (lbl, prev, real, tipo) => {
-    const esGasto = tipo==='gasto';
-    const desv = r2(real - prev);
-    const signoBueno = esGasto ? desv<=0 : desv>=0;
-    const barra = tipo==='balance' ? barraBalance(prev, real, frac) : barraPrev(prev, real, frac, esGasto);
-    return `<div style="margin-bottom:14px">
-      <div class="row" style="align-items:baseline;margin-bottom:2px">
-        <span class="micro"><strong>${lbl}</strong></span>
-        <span class="mono tiny"><span style="font-size:14px">${fmtEUR(real)}</span> <span class="muted">de ${fmtEUR(prev)} prev.</span>
-          <span class="${signoBueno?'pos':'neg'}" style="margin-left:6px">${desv>=0?'+':''}${fmtEUR(desv)}</span></span>
-      </div>
-      ${barra}
-    </div>`;
-  };
-
-  // categorías más desviadas (real por encima de previsto)
-  const desviadas = p.catGasto.map(c=>({...c, desv:r2(c.real-c.prev)}))
-    .filter(c=>c.prev>0).sort((a,b)=>b.desv-a.desv);
-  const pasadas = desviadas.filter(c=>c.desv>0).slice(0,5);
-
-  return `<div class="card">
-    <div class="row" onclick="togglePrevision()" style="cursor:pointer">
-      <span><strong>Previsión del mes</strong>${enCurso?` <span class="tiny muted">día ${new Date().getDate()}, ${Math.round(frac*100)}% transcurrido</span>`:''}</span>
-      <span class="micro ${desvBal>=0?'pos':'neg'} mono">balance ${desvBal>=0?'+':''}${fmtEUR(desvBal)} vs plan ▾</span>
-    </div>
-    ${previsionAbierta?`
-    <div style="margin-top:12px">
-      ${filaMain('Ingresos', p.ing.prev, p.ing.real, 'ingreso')}
-      ${filaMain('Gastos', p.gasto.prev, p.gasto.real, 'gasto')}
-      ${filaMain('Balance', p.balance.prev, p.balance.real, 'balance')}
-      <div class="tiny muted" style="margin:2px 0 12px">Relleno = real · línea negra = previsto${enCurso?' · línea gris = lo que llevarías si el gasto fuera uniforme (hoy)':''}. Verde = bien (gasto dentro del plan / ingreso alcanzado), rojo/ámbar = desviado.</div>
-      ${pasadas.length?`<div class="micro muted" style="margin-bottom:4px">Categorías por encima de lo previsto:</div>
-        ${pasadas.map(c=>`<div class="catrow" onclick="verCategoria('${c.id}')">
-          <span>${esc(c.nombre)}</span>
-          <span class="mono">${fmtEUR(c.real)} <span class="muted">/ ${fmtEUR(c.prev)}</span> <span class="neg">+${fmtEUR(c.desv)}</span></span>
-        </div>`).join('')}`
-        :`<div class="micro pos">Ninguna categoría se ha pasado del plan${enCurso?' de momento':''}.</div>`}
-    </div>`:''}
-  </div>`;
-}
-
-function cambiaMes(d){ const ms=meses(); const i=ms.indexOf(mesSel)+d; if(ms[i]){mesSel=ms[i]; grupoAbierto=null; render();} }
-function toggleGrupo(g){ grupoAbierto = grupoAbierto===g?null:g; render(); }
-function verCategoria(cid){ filtroCat = cid; vista='movimientos'; render(); window.scrollTo(0,0); }
-function filtraCat(m){
-  if (filtroCat==='__null') return m.categoriaId===null && m.importe<0;
-  if (filtroCat==='__ingsc') return m.categoriaId===null && m.importe>0;
-  return m.categoriaId===filtroCat;
-}
-
-function vMovs(){
-  const ms = meses();
-  if (!ms.length){ $('#main').innerHTML='<div class="vacio">Sin movimientos todavía.</div>'; return; }
-  if (!mesSel || !ms.includes(mesSel)) mesSel=ms[ms.length-1];
-  let lista = movsMes(mesSel);
-  if (filtroCat) lista = lista.filter(filtraCat);
-  if (filtroTxt) { const q=filtroTxt.toLowerCase(); lista = lista.filter(m=>(m.descripcion||'').toLowerCase().includes(q)); }
-  lista = [...lista].sort((a,b)=>b.fecha.localeCompare(a.fecha));
-  const idx = ms.indexOf(mesSel);
-  const opciones = ['<option value="">Todas las categorías</option>','<option value="__null">Sin clasificar</option>']
-    .concat(agrupaOpciones(filtroCat)).join('');
-  $('#main').innerHTML = `
-    <div class="mespicker">
-      <button onclick="cambiaMes(-1)" ${idx===0?'disabled':''} aria-label="Mes anterior">‹</button>
-      <span class="mes">${fmtYM(mesSel)}</span>
-      <button onclick="cambiaMes(1)" ${idx===ms.length-1?'disabled':''} aria-label="Mes siguiente">›</button>
-    </div>
-    <div class="filtros">
-      <select onchange="filtroCat=this.value;render()">${opciones}</select>
-    </div>
-    <div class="filtros"><input type="search" placeholder="Buscar en la descripción" value="${esc(filtroTxt)}" oninput="filtroTxt=this.value;renderListaMovs()"></div>
-    <div id="totalfiltro">${htmlTotalFiltro(lista)}</div>
-    <div class="card" id="listamovs">${htmlListaMovs(lista)}</div>`;
-}
-function htmlTotalFiltro(lista){
-  if (!lista.length) return '';
-  let ent=0, sal=0, interno=0;
-  for (const m of lista){
-    if (m.flujo==='interno'){ interno += m.importe; continue; }
-    if (m.importe>0) ent += m.importe; else sal += -m.importe;
-  }
-  const neto = r2(ent - sal);
-  const c = filtroCat && filtroCat!=='__null' && filtroCat!=='__ingsc' ? catById(filtroCat) : null;
-  const titulo = c ? c.nombre : (filtroCat==='__null' ? 'Gastos sin clasificar' : filtroCat==='__ingsc' ? 'Ingresos sin clasificar' : 'Selección');
-  const etiqueta = (c && c.tipo==='gasto') ? 'Gasto neto' : (c && c.tipo==='ingreso') ? 'Total' : 'Neto';
-  const valor = (c && c.tipo==='gasto') ? -neto : neto;
-  return `<div class="card" style="padding:11px 14px">
-    <div class="row"><span class="micro muted">${esc(titulo)} · ${lista.length} mov.</span>
-      <span class="mono" style="font-size:16px">${etiqueta}: <strong class="${valor<0?'pos':'neg'}">${fmtEUR2((c&&c.tipo==='gasto')?-valor:valor)}</strong></span></div>
-    ${ent&&sal?`<div class="tiny muted" style="margin-top:3px">${fmtEUR(sal)} en cargos${ent?` · ${fmtEUR(ent)} en abonos/reembolsos`:''}${interno?` · ${fmtEUR2(interno)} interno`:''}</div>`:''}
-  </div>`;
-}
-function agrupaOpciones(sel){
-  const grupos={};
-  for (const c of CATS){ (grupos[c.grupo]=grupos[c.grupo]||[]).push(c); }
-  return Object.entries(grupos).map(([g,cs])=>
-    `<optgroup label="${esc(g)}">${cs.map(c=>`<option value="${c.id}" ${c.id===sel?'selected':''}>${esc(c.nombre)}</option>`).join('')}</optgroup>`);
-}
-function htmlListaMovs(lista){
-  if (!lista.length) return '<div class="vacio">Nada que mostrar con estos filtros.</div>';
-  return lista.map(m=>{
-    const c=catById(m.categoriaId);
-    return `<div class="mov" onclick="abrirHoja('${m.id}')">
-      <span class="fecha">${fmtDia(m.fecha)}</span>
-      <span class="desc"><div class="truncate">${esc(descCorta(m))}</div>
-        <span class="cat">${c?esc(c.nombre):'Sin clasificar'}${m.flujo==='interno'?' <span class="pill">interno</span>':''}${m.via==='manual'?' <span class="pill rev">manual</span>':''}</span></span>
-      <span class="imp ${m.importe>0?'pos':m.flujo==='interno'?'int':'neg'}">${fmtEUR2(m.importe)}</span>
-    </div>`;
-  }).join('');
-}
-function renderListaMovs(){
-  let lista = movsMes(mesSel);
-  if (filtroCat) lista = lista.filter(filtraCat);
-  if (filtroTxt){ const q=filtroTxt.toLowerCase(); lista=lista.filter(m=>(m.descripcion||'').toLowerCase().includes(q)); }
-  lista = [...lista].sort((a,b)=>b.fecha.localeCompare(a.fecha));
-  $('#listamovs').innerHTML = htmlListaMovs(lista);
-  const tf = $('#totalfiltro'); if (tf) tf.innerHTML = htmlTotalFiltro(lista);
-}
-
-let bandejaModo = 'grupos';
-function gruposBandeja(){
-  const grupos = new Map();
-  for (const m of bandeja()){
-    const c = conceptoDe(m);
-    const k = c.tipo+'|'+c.clave.toUpperCase();
-    if (!grupos.has(k)) grupos.set(k,{tipo:c.tipo, clave:c.clave, movs:[], total:0});
-    const g = grupos.get(k); g.movs.push(m); g.total += Math.abs(m.importe);
-  }
-  return [...grupos.values()].sort((a,b)=>b.total-a.total);
-}
-
-/* ============ ANÁLISIS: evolución mensual ============ */
-let anPeriodo = 12;           // meses a mostrar
-let anChart1=null, anChart2=null, anChart3=null;
-const PALETA_GRUPOS = ['#A6432D','#C0623F','#CE8155','#1E6B4F','#3E8C6E','#57687A','#B8892E','#8A7A5C','#6E7B73','#C9A26B'];
-
-function serieMeses(n){
-  const ms = meses();
-  return ms.slice(Math.max(0, ms.length-n));
-}
-function nombreMesCorto(ym){ const [y,m]=ym.split('-'); return MESES[+m-1].slice(0,3)+' '+y.slice(2); }
-
-function vAnalisis(){
-  const ms = meses();
-  if (!ms.length){ $('#main').innerHTML='<div class="vacio">Sin datos todavía. Importa un extracto primero.</div>'; return; }
-  const opciones = [6,12,24,ms.length].filter((v,i,a)=>a.indexOf(v)===i && v<=ms.length || v===ms.length);
-  $('#main').innerHTML = `
-    <h2 class="seccion">Evolución</h2>
-    <div class="filtros">
-      <select onchange="anPeriodo=+this.value;render()">
-        <option value="6" ${anPeriodo===6?'selected':''}>Últimos 6 meses</option>
-        <option value="12" ${anPeriodo===12?'selected':''}>Últimos 12 meses</option>
-        <option value="24" ${anPeriodo===24?'selected':''}>Últimos 24 meses</option>
-        <option value="999" ${anPeriodo>=999?'selected':''}>Todo el histórico</option>
-      </select>
-    </div>
-    <div class="card"><div class="micro muted" style="margin-bottom:6px">Ingresos, gastos y balance</div><div style="height:220px"><canvas id="ch-flujo"></canvas></div></div>
-    <div class="card"><div class="micro muted" style="margin-bottom:6px">Tasa de ahorro mensual</div><div style="height:170px"><canvas id="ch-ahorro"></canvas></div></div>
-    <div class="card"><div class="micro muted" style="margin-bottom:6px">Gasto por grupo</div><div style="height:240px"><canvas id="ch-grupos"></canvas></div>
-      <div id="leyenda-grupos" class="leyenda" style="margin-top:10px"></div></div>
-    <div id="an-resumen"></div>
-    ${htmlFlujosEvolucion()}
-    <div class="card" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center" onclick="irA('simulador')">
-      <span class="gnom" style="gap:10px"><span style="font-size:20px">🧮</span><strong>Simulador de ahorro</strong></span>
-      <span style="color:var(--marca)">›</span>
-    </div>
-    ${htmlRecurrentes()}`;
-  // pintar tras insertar el DOM
-  setTimeout(pintarGraficas, 30);
-}
-
-/* Simulador: parte del gasto medio real por categoría (12m) y aplica recortes para ver
-   cuánto se ahorraría al mes y al año. Los recortes viven en simRecortes (no se guardan). */
-let simRecortes = {};   // {catId: porcentaje 0-100}
-function gastoMedioCategoria(){
-  const serie = serieMeses(12);
-  const suma = {}, cuenta = serie.length || 1;
-  for (const m of MOVS){
-    if (!serie.includes(m.ym) || m.importe>=0 || !m.categoriaId) continue;
-    const c = catById(m.categoriaId);
-    if (!c || c.tipo!=='gasto') continue;
-    suma[m.categoriaId] = (suma[m.categoriaId]||0) + (-m.importe);
-  }
-  const arr = Object.entries(suma).map(([cid,tot])=>({cid, media:tot/cuenta, c:catById(cid)}))
-    .filter(x=>x.media>=10).sort((a,b)=>b.media-a.media);
-  return arr;
-}
-function vSimulador(){
-  const cats = gastoMedioCategoria();
-  if (!cats.length){ $('#main').innerHTML='<div class="vacio">Necesito algunos meses de gastos para simular.</div>'; return; }
-  const gastoBase = cats.reduce((s,x)=>s+x.media,0);
-  const ahorroMes = cats.reduce((s,x)=>s + x.media*((simRecortes[x.cid]||0)/100), 0);
-  const nuevoGasto = gastoBase - ahorroMes;
-  const activos = Object.entries(simRecortes).filter(([,v])=>v>0);
-  $('#main').innerHTML = `
-    <h2 class="seccion">Simulador de ahorro 🧮</h2>
-    <div class="card" style="background:var(--marca-bg);box-shadow:none">
-      <div class="micro muted">Si mantienes estos recortes, ahorrarías</div>
-      <div class="serif" style="font-size:30px;font-weight:600;color:var(--marca);letter-spacing:-0.01em">${fmtEUR(ahorroMes)}<span style="font-size:16px">/mes</span></div>
-      <div class="row" style="margin-top:4px"><span class="micro muted">Al año</span><span class="mono" style="color:var(--marca);font-weight:600">${fmtEUR(ahorroMes*12)}</span></div>
-      <div class="row"><span class="micro muted">Gasto mensual: ${fmtEUR(gastoBase)} → ${fmtEUR(nuevoGasto)}</span></div>
-      ${activos.length?`<button class="btn sec" style="margin-top:10px;padding:7px 12px;font-size:13px" onclick="simReset()">Quitar recortes</button>`:''}
-    </div>
-    <p class="micro muted" style="margin:0 4px 12px">Mueve el recorte de cada categoría y mira cuánto ahorrarías. Se basa en tu gasto medio de los últimos 12 meses. Es una simulación: no cambia tus datos ni tu presupuesto.</p>
-    ${cats.map(x=>{
-      const pct = simRecortes[x.cid]||0;
-      const ahorra = x.media*(pct/100);
-      return `<div class="card" style="padding:13px 15px">
-        <div class="row" style="margin-bottom:8px"><span class="gnom"><span class="gic">${iconoGrupo(x.c?.grupo)}</span>${esc(x.c?.nombre||'?')}</span>
-          <span class="mono micro">${fmtEUR(x.media)}<span class="muted">/mes</span></span></div>
-        <div style="display:flex;align-items:center;gap:10px">
-          <input type="range" min="0" max="100" step="5" value="${pct}" oninput="simSet('${x.cid}',this.value)" style="flex:1">
-          <span class="mono" style="width:82px;text-align:right;font-size:13px">${pct>0?`−${pct}% · ${fmtEUR(ahorra)}`:'sin recorte'}</span>
-        </div>
-      </div>`;
-    }).join('')}`;
-}
-function simSet(cid,val){
-  simRecortes[cid] = +val;
-  // actualizar solo los totales sin re-render completo (para no perder el foco del slider)
-  render();
-}
-function simReset(){ simRecortes = {}; render(); }
-
-
-function htmlRecurrentes(){
-  const rec = detectarRecurrentes();
-  if (!rec.length) return '';
-  const suben = rec.filter(r=>r.hayComparacionAnual && r.subidaPct>=8);
-  const iconoR = catId => { const c=catById(catId); return c?iconoGrupo(c.grupo):'🔁'; };
-  const fila = r => {
-    const sube = r.hayComparacionAnual && r.subidaPct>=8, baja = r.hayComparacionAnual && r.subidaPct<=-8;
-    const col = sube?'var(--gasto)':baja?'var(--ingreso)':'var(--muted)';
-    const flecha = sube?'↑':baja?'↓':'→';
-    return `<div class="grupo" onclick="verRecurrente('${esc(r.claveRaw)}')">
-      <div class="row"><span class="gnom"><span class="gic">${iconoR(r.catId)}</span>${esc(r.clave)}</span>
-        <span class="mono">${fmtEUR(r.actual)}<span class="micro muted">/mes</span></span></div>
-      <div class="tiny muted" style="margin-top:4px">${r.mesesN} meses · ${catById(r.catId)?.nombre||''}
-        ${(sube||baja)?`<span style="color:${col};font-weight:600;margin-left:4px">${flecha} ${r.subidaPct>=0?'+':''}${Math.round(r.subidaPct)}% vs hace un año</span>`:''}</div>
-    </div>`;
-  };
-  return `<h2 class="seccion">Gastos recurrentes</h2>
-    ${suben.length?`<div class="card" style="background:var(--gasto-bg);box-shadow:none">
-      <div class="row" style="align-items:flex-start"><span style="font-size:20px;margin-right:4px">📈</span>
-        <div style="flex:1"><strong style="color:var(--gasto)">${suben.length} recibo${suben.length>1?'s han':' ha'} subido de precio</strong>
-        <div class="tiny" style="color:var(--gasto);margin-top:2px">${suben.slice(0,3).map(r=>esc(r.clave)+' +'+Math.round(r.subidaPct)+'%').join(' · ')}${suben.length>3?'…':''}</div></div></div>
-    </div>`:''}
-    <p class="micro muted" style="margin:0 4px 10px">Pagos que se repiten cada mes con importe estable (suscripciones, recibos, cuotas). La flecha compara el importe reciente con el de los mismos meses del año pasado (si hay al menos un año de historial).</p>
-    <div class="card">${rec.map(fila).join('')}</div>`;
-}
-function verRecurrente(clave){ filtroCat=''; filtroTxt=clave; vista='movimientos'; render(); window.scrollTo(0,0); }
-
-
-function datosAnalisis(){
-  const serie = serieMeses(anPeriodo>=999 ? meses().length : anPeriodo);
-  const res = serie.map(ym=>({ym, r:resumenMes(ym)}));
-  // grupos de gasto presentes, ordenados por gasto total en el periodo
-  const totalGrupo = {};
-  for (const {r} of res) for (const [g,v] of Object.entries(r.porGrupo)) if(g!=='Sin clasificar') totalGrupo[g]=(totalGrupo[g]||0)+v;
-  const gruposOrd = Object.entries(totalGrupo).sort((a,b)=>b[1]-a[1]).map(([g])=>g);
-  const topGrupos = gruposOrd.slice(0,6);
-  const resto = gruposOrd.slice(6);
-  return {serie, res, topGrupos, resto};
-}
-
-/* Detección de recurrentes: comercios que aparecen en muchos meses con importe estable.
-   Devuelve suscripciones/recibos fijos, marcando los que han subido de precio. */
-function limpiarNombreRec(clave){
-  let s = clave.replace(/^CORE/i,'').replace(/^PAYPAL \*/i,'').replace(/^PRES\.\d+/i,'Préstamo/Hipoteca');
-  s = s.replace(/\b(S\.?A\.?U?|S\.?L\.?U?|SOCIEDAD ANONIMA|SOCIEDAD A|CLIENTES|UNIPERSONAL)\b\.?/gi,'').trim();
-  s = s.replace(/[,.\s]+$/,'').trim();
-  // capitalizar bonito, dejando conectores en minúscula
-  const conect = new Set(['de','del','la','el','los','las','y','e']);
-  return s.split(' ').filter(Boolean).map((w,i)=>{
-    const lw = w.toLowerCase();
-    if (i>0 && conect.has(lw)) return lw;
-    return w.length>2 ? w.charAt(0)+w.slice(1).toLowerCase() : w.toUpperCase();
-  }).join(' ') || clave;
-}
-// categorías que son "recibos de verdad" cuya subida importa vigilar
-const CATS_RECIBO = new Set(['suministros','telecom','seguros','suscripciones','comunidad','hipoteca','prestamo_coche','prestamos','educacion']);
-// mismo mes, un año antes ('2026-03' -> '2025-03')
-function ymHaceUnAnio(ym){
-  const [y,m] = ym.split('-').map(Number);
-  return (y-1)+'-'+String(m).padStart(2,'0');
-}
-function detectarRecurrentes(){
-  const gastos = MOVS.filter(m=>m.importe<0);
-  const grupos = {};
-  for (const m of gastos){
-    const con = conceptoDe(m);
-    if (con.tipo!=='comercio' || con.clave==='Compra con tarjeta sin comercio' || con.clave==='CUOTA TARJETA') continue;
-    // clave normalizada para agrupar variantes del mismo emisor (quita sufijos societarios)
-    const norm = con.clave.toLowerCase().replace(/^core/,'').replace(/\b(s\.?a\.?u?|s\.?l\.?u?|sociedad anonima|sociedad a|clientes|unipersonal)\b\.?/gi,'').replace(/[,.\s]+/g,' ').trim();
-    (grupos[norm] = grupos[norm] || {clave:con.clave, movs:[]}).movs.push(m);
-  }
-  const rec = [];
-  for (const k in grupos){
-    const g = grupos[k];
-    const byMes = {};
-    for (const m of g.movs){ byMes[m.ym] = (byMes[m.ym]||0) + (-m.importe); }
-    const meses = Object.keys(byMes).sort();
-    if (meses.length < 6) continue;
-    const vals = meses.map(ym=>byMes[ym]);
-    const media = vals.reduce((a,b)=>a+b,0)/vals.length;
-    const cv = Math.sqrt(vals.reduce((s,x)=>s+(x-media)**2,0)/vals.length)/media;
-    if (cv >= 0.30) continue;
-    const cats = {}; g.movs.forEach(m=>{ if(m.categoriaId) cats[m.categoriaId]=(cats[m.categoriaId]||0)+1; });
-    const catId = Object.entries(cats).sort((a,b)=>b[1]-a[1])[0]?.[0] || null;
-    // "actual": media de los últimos meses (hasta 3) — precio reciente
-    const nRecientes = Math.min(3, meses.length);
-    const recientesYM = meses.slice(-nRecientes);
-    const mu = recientesYM.reduce((s,ym)=>s+byMes[ym],0)/nRecientes;
-    // comparación interanual: los mismos meses pero un año antes, NO desde el inicio del
-    // histórico (comparar contra 2023 no tiene sentido si estamos en 2026). Si no hay al
-    // menos la mitad de esos meses un año antes, no se muestra comparación.
-    const anteriorYM = recientesYM.map(ymHaceUnAnio).filter(ym=>byMes[ym]!=null);
-    let subidaPct = 0, hayComparacionAnual = false;
-    if (anteriorYM.length >= Math.max(2, Math.ceil(nRecientes/2))){
-      const mp = anteriorYM.reduce((s,ym)=>s+byMes[ym],0)/anteriorYM.length;
-      if (mp>0){ subidaPct = (mu-mp)/mp*100; hayComparacionAnual = true; }
-    }
-    rec.push({
-      clave: limpiarNombreRec(g.clave), claveRaw: g.clave.toLowerCase(), catId, media, cv, mesesN: meses.length,
-      actual: mu, subidaPct, hayComparacionAnual, primerYM: meses[0], ultimoYM: meses[meses.length-1],
-      esRecibo: CATS_RECIBO.has(catId)
-    });
-  }
-  rec.sort((a,b)=> (b.hayComparacionAnual&&b.subidaPct>=8&&b.esRecibo?1:0)-(a.hayComparacionAnual&&a.subidaPct>=8&&a.esRecibo?1:0) || b.media-a.media);
-  return rec;
-}
-// para el aviso destacado solo cuentan recibos de verdad que suben (no restauración puntual)
-function recurrentesConSubida(){ return detectarRecurrentes().filter(r=>r.hayComparacionAnual && r.subidaPct>=8 && r.esRecibo); }
-
-/* Detección de gastos anómalos: importes muy por encima de lo normal en su categoría.
-   Excluye flujos internos y traspasos/Bizums a uno mismo (no son gasto real). */
-function detectarAnomalos(mesFiltro){
-  // estadísticas por categoría de gasto sobre todo el histórico
-  const porCat = {};
-  for (const m of MOVS){
-    if (m.importe>=0 || !m.categoriaId) continue;
-    const c = catById(m.categoriaId);
-    if (!c || c.tipo!=='gasto') continue;              // solo gasto real (excluye internos/ingresos)
-    (porCat[m.categoriaId] = porCat[m.categoriaId]||[]).push(-m.importe);
-  }
-  const stats = {};
-  for (const cid in porCat){
-    const arr = porCat[cid];
-    const media = arr.reduce((a,b)=>a+b,0)/arr.length;
-    const sd = Math.sqrt(arr.reduce((s,x)=>s+(x-media)**2,0)/arr.length);
-    stats[cid] = {media, sd, n:arr.length};
-  }
-  const propios = new Set([...(REGLAS.nombresPropios||[])].map(s=>s.toLowerCase()));
-  const anom = [];
-  for (const m of MOVS){
-    if (m.importe>=0 || !m.categoriaId) continue;
-    if (mesFiltro && m.ym!==mesFiltro) continue;
-    const c = catById(m.categoriaId);
-    if (!c || c.tipo!=='gasto') continue;
-    // excluir traspasos/Bizums a uno mismo aunque estén como gasto
-    const con = conceptoDe(m);
-    const claveL = con.clave.toLowerCase();
-    const desc = (m.descripcion||'').toLowerCase();
-    const esPropio = [...propios].some(p=>p && (claveL.includes(p) || desc.includes(p)));
-    const esTraspaso = /traspaso/.test(desc);
-    if (esPropio || esTraspaso) continue;
-    const s = stats[m.categoriaId];
-    if (!s || s.n<8) continue;                         // categoría con pocos datos: no fiable
-    const v = -m.importe;
-    const umbral = Math.max(s.media + 3*s.sd, s.media*2.5);  // muy por encima de lo habitual
-    if (v>=umbral && v>=100){
-      anom.push({id:m.id, fecha:m.fecha, ym:m.ym, importe:v, catId:m.categoriaId,
-        concepto: con.clave, media:s.media, veces:+(v/s.media).toFixed(1)});
-    }
-  }
-  anom.sort((a,b)=>b.fecha.localeCompare(a.fecha) || b.importe-a.importe);
-  return anom;
-}
-function anomalosMes(ym){ return detectarAnomalos(ym); }
-
-// Categorías de tipo 'interno' con datos en la serie (no fijamos solo ahorro/traspasos:
-// cualquier categoría interna con movimientos aparece)
-function categoriasInternoConDatos(serie){
-  const ids = new Set();
-  for (const ym of serie) for (const m of movsMes(ym)){
-    const c = catById(m.categoriaId);
-    if (c && c.tipo==='interno') ids.add(c.id);
-  }
-  return [...ids].map(id=>catById(id)).filter(Boolean);
-}
-// serie mensual de sale/entra/neto para una categoría de flujo interno concreta
-function serieCategoriaInterno(catId, serie){
-  return serie.map(ym=>{
-    let sale=0, entra=0;
-    for (const m of movsMes(ym)){
-      if (m.categoriaId!==catId) continue;
-      if (m.importe<0) sale += -m.importe; else entra += m.importe;
-    }
-    return {ym, sale:r2(sale), entra:r2(entra), neto:r2(entra-sale)};
-  });
-}
-// Evolución mes a mes de los flujos internos, desglosada por categoría (ahorro, traspasos,
-// devoluciones...) y mostrando cuánto sale y cuánto vuelve en cada una, no solo el neto.
-function htmlFlujosEvolucion(){
-  const serie = serieMeses(anPeriodo>=999 ? meses().length : anPeriodo);
-  const cats = categoriasInternoConDatos(serie);
-  if (!cats.length) return '';
-  const ingPeriodo = r2(serie.reduce((s,ym)=>s+resumenMes(ym).ingReal,0));
-  const gasPeriodo = r2(serie.reduce((s,ym)=>s+resumenMes(ym).gasReal,0));
-  const icono = c => c.id==='ahorro'?'🏦':c.id==='traspasos'?'🔄':c.id==='devoluciones'?'↩️':'🔁';
-  const bloques = cats.map(c=>{
-    const datos = serieCategoriaInterno(c.id, serie);
-    const totalSale = r2(datos.reduce((s,x)=>s+x.sale,0));
-    const totalEntra = r2(datos.reduce((s,x)=>s+x.entra,0));
-    const totalNeto = r2(totalEntra-totalSale);
-    const max = Math.max(...datos.map(x=>Math.max(x.sale,x.entra)), 1);
-    return `<div style="margin-bottom:18px">
-      <div class="row" style="align-items:baseline;margin-bottom:6px">
-        <span class="micro"><strong>${icono(c)} ${esc(c.nombre)}</strong></span>
-        <span class="mono tiny">sale ${fmtEUR(totalSale)} · entra ${fmtEUR(totalEntra)} · <span class="${totalNeto>=0?'pos':'neg'}">neto ${totalNeto>=0?'+':''}${fmtEUR(totalNeto)}</span></span>
-      </div>
-      ${datos.map(x=>`<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-        <span class="tiny muted mono" style="width:38px">${nombreMesCorto(x.ym)}</span>
-        <div style="flex:1">${barraEntradaSalida(x.sale, x.entra, max)}</div>
-        <span class="tiny mono ${x.neto>=0?'pos':'neg'}" style="width:64px;text-align:right">${x.neto>=0?'+':''}${fmtEUR(x.neto)}</span>
-      </div>`).join('')}
-      <div class="catrow" onclick="verCategoria('${c.id}')" style="justify-content:flex-end;padding:4px 0 0"><span class="micro" style="color:var(--marca)">Ver movimientos ›</span></div>
-    </div>`;
-  }).join('');
-  return `<h2 class="seccion">Flujos internos · evolución 🔄</h2>
-    <div class="card">
-      <p class="micro muted" style="margin-top:0">Rojo = sale de tu bolsillo hacia otra cuenta propia; verde = vuelve. No es gasto ni ingreso real, pero sí está descontado del Balance (esta cuenta se queda sin ese dinero). En este periodo tus ingresos reales fueron ${fmtEUR(ingPeriodo)} y tu gasto real ${fmtEUR(gasPeriodo)}.</p>
-      ${bloques}
-    </div>`;
-}
-
-
-function pintarGraficas(){
-  if (typeof Chart==='undefined'){ return; }
-  const {serie, res, topGrupos, resto} = datosAnalisis();
-  const labels = serie.map(nombreMesCorto);
-  const css = getComputedStyle(document.documentElement);
-  const cIng = css.getPropertyValue('--ingreso').trim(), cGas = css.getPropertyValue('--gasto').trim();
-  const cInk = css.getPropertyValue('--ink').trim(), cMuted = css.getPropertyValue('--muted').trim();
-  const gridC = 'rgba(0,0,0,0.06)';
-  const baseOpts = tituloEje => ({
-    responsive:true, maintainAspectRatio:false,
-    plugins:{legend:{display:false}, tooltip:{callbacks:{label:c=>c.dataset.label+': '+fmtEUR(c.parsed.y)}}},
-    scales:{ x:{grid:{display:false},ticks:{color:cMuted,font:{size:10}}},
-             y:{grid:{color:gridC},ticks:{color:cMuted,font:{size:10},callback:v=>v>=1000?(v/1000)+'k':v}} }
-  });
-  [anChart1,anChart2,anChart3].forEach(c=>c&&c.destroy());
-
-  // 1) ingresos / gastos / balance
-  anChart1 = new Chart(document.getElementById('ch-flujo'), {
-    type:'bar',
-    data:{labels, datasets:[
-      {label:'Ingresos', data:res.map(x=>x.r.ingReal), backgroundColor:cIng, borderRadius:3, order:2},
-      {label:'Gastos', data:res.map(x=>x.r.gasReal), backgroundColor:cGas, borderRadius:3, order:2},
-      {label:'Balance', data:res.map(x=>x.r.balance), type:'line', borderColor:cInk, backgroundColor:cInk, borderWidth:2, tension:0.3, pointRadius:2, order:1}
-    ]},
-    options:{...baseOpts(), plugins:{...baseOpts().plugins, legend:{display:true, position:'bottom', labels:{boxWidth:10,font:{size:10},color:cMuted}}}}
-  });
-  // 2) tasa de ahorro
-  const tasa = res.map(x=> x.r.ingReal>0 ? Math.round(x.r.balance/x.r.ingReal*100) : 0);
-  anChart2 = new Chart(document.getElementById('ch-ahorro'), {
-    type:'line',
-    data:{labels, datasets:[{label:'Ahorro', data:tasa, borderColor:cIng, backgroundColor:'rgba(30,107,79,0.12)', fill:true, tension:0.3, pointRadius:2}]},
-    options:{...baseOpts(), plugins:{legend:{display:false}, tooltip:{callbacks:{label:c=>c.parsed.y+'% de ahorro'}}},
-      scales:{x:{grid:{display:false},ticks:{color:cMuted,font:{size:10}}}, y:{grid:{color:gridC},ticks:{color:cMuted,font:{size:10},callback:v=>v+'%'}}}}
-  });
-  // 3) gasto por grupo (barras apiladas)
-  const dsGrupos = topGrupos.map((g,i)=>({label:g, data:res.map(x=>r2(x.r.porGrupo[g]||0)), backgroundColor:PALETA_GRUPOS[i], stack:'g'}));
-  if (resto.length) dsGrupos.push({label:'Otros grupos', data:res.map(x=>r2(resto.reduce((s,g)=>s+(x.r.porGrupo[g]||0),0))), backgroundColor:PALETA_GRUPOS[9], stack:'g'});
-  anChart3 = new Chart(document.getElementById('ch-grupos'), {
-    type:'bar',
-    data:{labels, datasets:dsGrupos},
-    options:{...baseOpts(), plugins:{legend:{display:false}, tooltip:{callbacks:{label:c=>c.dataset.label+': '+fmtEUR(c.parsed.y)}}},
-      scales:{x:{stacked:true,grid:{display:false},ticks:{color:cMuted,font:{size:10}}}, y:{stacked:true,grid:{color:gridC},ticks:{color:cMuted,font:{size:10},callback:v=>v>=1000?(v/1000)+'k':v}}}}
-  });
-  // leyenda de grupos
-  const leyenda = topGrupos.map((g,i)=>`<span><span class="dot" style="background:${PALETA_GRUPOS[i]}"></span>${esc(g)}</span>`).join('')
-    + (resto.length?`<span><span class="dot" style="background:${PALETA_GRUPOS[9]}"></span>Otros grupos</span>`:'');
-  const lg = document.getElementById('leyenda-grupos'); if(lg) lg.innerHTML = leyenda;
-
-  // mini-resumen del periodo
-  const ing = res.reduce((s,x)=>s+x.r.ingReal,0), gas = res.reduce((s,x)=>s+x.r.gasReal,0);
-  const bal = res.reduce((s,x)=>s+x.r.balance,0);
-  const mesesN = res.length;
-  const ar = document.getElementById('an-resumen');
-  if (ar) ar.innerHTML = `<div class="card"><div class="micro muted">Medias del periodo (${mesesN} meses)</div>
-    <div class="row" style="margin-top:6px"><span>Ingreso medio/mes</span><span class="mono pos">${fmtEUR(ing/mesesN)}</span></div>
-    <div class="row"><span>Gasto medio/mes</span><span class="mono neg">${fmtEUR(gas/mesesN)}</span></div>
-    <div class="row"><span>Balance medio/mes</span><span class="mono ${bal>=0?'pos':'neg'}">${fmtEUR(bal/mesesN)}</span></div>
-    <div class="row"><span>Tasa de ahorro media</span><span class="mono">${ing>0?Math.round(bal/ing*100):0}%</span></div>
-  </div>`;
-}
-
-function vPresupuesto(){
-  // asegura que hay planCalc (gastos e ingresos); si nunca se ha calculado y hay datos, calcula
-  const faltaCalc = CATS.some(c=>(c.tipo==='gasto'||c.tipo==='ingreso'||c.tipo==='interno') && c.planCalc==null);
-  if (faltaCalc && MOVS.length){ recalcularPlanes(); guardarConfig(); }
-
-  const modoMes = presuMes;               // null = presupuesto base; 'YYYY-MM' = override de ese mes
-  const gastoCats = CATS.filter(c=>c.tipo==='gasto');
-  const ingCats = CATS.filter(c=>c.tipo==='ingreso');
-  const internoCats = CATS.filter(c=>c.tipo==='interno');
-  const grupos = [...new Set(gastoCats.map(c=>c.grupo))];
-  let totCalc=0, totEfect=0, nAjustes=0;
-  for (const c of gastoCats){ totCalc += (c.planCalc||0); totEfect += planEfectivo(c,modoMes); if(modoMes?tieneOverride(c.id,modoMes):c.planManual!=null) nAjustes++; }
-  const dif = totEfect - totCalc;
-  const ingEfect = ingCats.reduce((s,c)=>s+planEfectivo(c,modoMes),0);
-  // flujo interno previsto (positivo = sale de la cuenta hacia ahorro/otras cuentas propias)
-  let totInternoEfect=0, nAjustesInterno=0;
-  for (const c of internoCats){ totInternoEfect += planEfectivo(c,modoMes); if(modoMes?tieneOverride(c.id,modoMes):c.planManual!=null) nAjustesInterno++; }
-  // Balance previsto ya descuenta el traspaso: esta cuenta se queda sin ese dinero, vaya donde vaya
-  const balancePrev = r2(ingEfect - totEfect - totInternoEfect);
-  const salidaTotal = r2(totEfect + totInternoEfect);      // todo lo que sale de la cuenta: gasto + traspasos
-  // referencia histórica (mediana de los últimos 12 meses) de cuánto sale y cuánto vuelve en
-  // conjunto en los flujos internos, para poder entender de qué se compone la diferencia
-  const refInterno = internoCats.reduce((acc,c)=>{
-    const h = historicoSalidaEntrada(c.id);
-    acc.sale += h.sale; acc.entra += h.entra; return acc;
-  }, {sale:0, entra:0});
-
-  const filaCat = c => {
-    if (modoMes){
-      // modo mes concreto: el override manda; el "base" es el valor de referencia
-      const ov = tieneOverride(c.id, modoMes);
-      const base = planEfectivo(c); // sin ym = base
-      return `<div class="presu-row">
-        <span class="presu-nom">${esc(c.nombre)}</span>
-        <span class="presu-calc micro muted mono">base ${fmtEUR(base)}</span>
-        <span class="presu-input">
-          <input type="text" inputmode="decimal" value="${ov?META.overrides[modoMes][c.id]:''}" placeholder="${base}"
-                 onchange="fijarOverride('${c.id}',this.value)" class="${ov?'ajustado':''}">
-        </span>
-        ${ov?`<button class="presu-x" title="Usar el presupuesto base" onclick="quitarOverride('${c.id}')">×</button>`:'<span class="presu-x"></span>'}
-      </div>`;
-    }
-    const manual = c.planManual!=null;
-    return `<div class="presu-row">
-      <span class="presu-nom">${esc(c.nombre)}</span>
-      <span class="presu-calc micro muted mono">calc ${fmtEUR(c.planCalc||0)}</span>
-      <span class="presu-input">
-        <input type="text" inputmode="decimal" id="pm-${c.id}" value="${manual?c.planManual:''}" placeholder="${c.planCalc||0}"
-               onchange="fijarPlan('${c.id}',this.value)" class="${manual?'ajustado':''}">
-      </span>
-      ${manual?`<button class="presu-x" title="Volver al calculado" onclick="quitarPlan('${c.id}')">×</button>`:'<span class="presu-x"></span>'}
-    </div>`;
-  };
-
-  // opciones de mes: base + meses con datos + próximos 3 meses
-  const msData = meses();
-  const proximos = [];
-  { const d=new Date(); for(let i=0;i<4;i++){ const ym=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`; proximos.push(ym); d.setMonth(d.getMonth()+1);} }
-  const opcionesMes = [...new Set([...msData, ...proximos])].sort();
-
-  $('#main').innerHTML = `
-    <h2 class="seccion">Presupuesto</h2>
-    <div class="filtros">
-      <select onchange="presuMes=this.value||null;render()">
-        <option value="" ${!modoMes?'selected':''}>Presupuesto base (todos los meses)</option>
-        <optgroup label="Ajuste para un mes concreto">
-          ${opcionesMes.map(ym=>`<option value="${ym}" ${modoMes===ym?'selected':''}>${nombreMesLargo(ym)}${overridesDeMes(ym)?' ●':''}</option>`).join('')}
-        </optgroup>
-      </select>
-    </div>
-    ${modoMes?`<div class="card" style="background:var(--marca-bg);box-shadow:none;padding:12px 14px">
-      <div class="micro" style="color:var(--marca)"><strong>Ajustando solo ${nombreMesLargo(modoMes)}</strong></div>
-      <div class="tiny muted" style="margin-top:2px">Los valores que fijes aquí solo aplican a este mes (p. ej. vacaciones, un mes con gasto extra). El resto de meses siguen con el presupuesto base. Deja vacío para usar el base.</div>
-    </div>`:''}
-    <div class="kpis" style="grid-template-columns:1fr 1fr 1fr">
-      <div class="kpi"><div class="lbl">Ingreso previsto</div><div class="val pos">${fmtEUR(ingEfect)}</div></div>
-      <div class="kpi"><div class="lbl">Gasto previsto</div><div class="val neg">${fmtEUR(totEfect)}</div><div class="sub">${nAjustes?`${nAjustes} ${modoMes?'ajuste'+(nAjustes>1?'s':'')+' este mes':'ajuste'+(nAjustes>1?'s':'')}`:'sin ajustes'}</div></div>
-      <div class="kpi"><div class="lbl">Balance previsto</div><div class="val ${balancePrev>=0?'pos':'neg'}">${fmtEUR(balancePrev)}</div></div>
-    </div>
-    ${!modoMes?`<p class="micro muted" style="margin:0 4px 12px">El plan calculado sale de la mediana (o media, en categorías irregulares) de tus últimos 12 meses. Fija un valor a mano si sabes que será distinto. Esto alimenta la previsión vs real del Resumen.</p>`:''}
-
-    ${internoCats.length?`<div class="card" style="padding:12px 14px">
-      <div class="micro muted">Traspaso a tus cuentas propias <span class="tiny">(no es gasto, pero sale de la cuenta)</span></div>
-      <div class="row" style="margin-top:8px"><span class="tiny muted">Suele salir de la cuenta</span><span class="mono neg">-${fmtEUR(refInterno.sale)}</span></div>
-      <div class="row" style="margin-top:3px"><span class="tiny muted">Suele volver</span><span class="mono pos">+${fmtEUR(refInterno.entra)}</span></div>
-      <div class="row" style="margin-top:6px;padding-top:8px;border-top:1px solid var(--line)">
-        <span class="micro"><strong>Diferencia prevista${modoMes?` (${nombreMesLargo(modoMes)})`:''}</strong></span>
-        <span class="mono" style="font-weight:600;color:var(--interno)">${totInternoEfect>=0?'-':'+'}${fmtEUR(Math.abs(totInternoEfect))}</span>
-      </div>
-      <p class="tiny muted" style="margin:8px 0 0">"Sale" y "vuelve" son la mediana de tus últimos 12 meses, para que entiendas de qué se compone. La diferencia es la cifra que ya está descontada en el <strong>Balance previsto</strong> de arriba — ajústala en <strong>Traspasos a tus cuentas</strong> si este ${modoMes?'mes':'periodo'} vas a mover más o menos.${nAjustesInterno?` Ahora mismo tienes ${nAjustesInterno} ajuste${nAjustesInterno>1?'s':''} a mano.`:''}</p>
-    </div>`:''}
-
-    <h2 class="seccion" style="margin-top:8px">Ingresos esperados</h2>
-    <div class="card" style="padding:12px 14px">
-      ${ingCats.map(filaCat).join('')}
-    </div>
-
-    <h2 class="seccion">Gastos</h2>
-    ${grupos.map(g=>{
-      const cats = gastoCats.filter(c=>c.grupo===g);
-      const gCalc = cats.reduce((s,c)=>s+(c.planCalc||0),0);
-      const gEf = cats.reduce((s,c)=>s+planEfectivo(c,modoMes),0);
-      return `<div class="card" style="padding:12px 14px">
-        <div class="row" style="margin-bottom:8px"><strong>${esc(g)}</strong><span class="mono">${fmtEUR(gEf)}${gEf!==gCalc&&!modoMes?` <span class="micro muted">calc ${fmtEUR(gCalc)}</span>`:''}</span></div>
-        ${cats.map(filaCat).join('')}
-      </div>`;
-    }).join('')}
-
-    ${internoCats.length?`<h2 class="seccion">Traspasos a tus cuentas <span class="tiny muted">(no es gasto, pero sale de la cuenta)</span></h2>
-    <div class="card" style="padding:12px 14px">
-      <p class="micro muted" style="margin-top:0">Cuánto planeas mover a ahorro u otras cuentas propias. Se calcula igual que el resto (mediana de los últimos 12 meses) y puedes ajustarlo aquí abajo para ver cómo cambia el Balance previsto si traspasas más o menos.${nAjustesInterno?` <strong>${nAjustesInterno} ajuste${nAjustesInterno>1?'s':''}${modoMes?' este mes':''}.</strong>`:''}</p>
-      ${internoCats.map(c=>{
-        const h = historicoSalidaEntrada(c.id);
-        return filaCat(c) + `<div class="tiny muted" style="margin:-6px 0 10px 2px">sale ${fmtEUR(h.sale)} · entra ${fmtEUR(h.entra)} <span class="micro">(mediana histórica)</span></div>`;
-      }).join('')}
-      <div class="row" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
-        <span class="micro muted">Total que sale de la cuenta <span class="tiny">(gasto + traspasos)</span></span>
-        <span class="mono neg">${fmtEUR(salidaTotal)}</span>
-      </div>
-      <div class="row" style="margin-top:6px">
-        <span class="micro"><strong>Balance previsto</strong> <span class="tiny muted">(el mismo de arriba)</span></span>
-        <span class="mono" style="font-weight:600;color:${balancePrev>=0?'var(--ingreso)':'var(--gasto)'}">${fmtEUR(balancePrev)}</span>
-      </div>
-    </div>`:''}
-
-    ${!modoMes?`<div class="card" style="padding:12px 14px">
-      <button class="btn sec" onclick="recalcularYGuardar()">Recalcular desde el histórico</button>
-      <p class="tiny muted" style="margin:8px 0 0">Actualiza el plan calculado (gastos, ingresos y traspasos) con los movimientos más recientes. No toca tus ajustes a mano.</p>
-    </div>`:''}`;
-}
-function nombreMesLargo(ym){ const [y,m]=ym.split('-'); return MESES[+m-1].charAt(0).toUpperCase()+MESES[+m-1].slice(1)+' '+y; }
-function overridesDeMes(ym){ return META.overrides && META.overrides[ym] ? Object.keys(META.overrides[ym]).length : 0; }
-async function fijarOverride(catId, valor){
-  const v = valor.trim().replace(/[^\d.,-]/g,'').replace(/\./g,'').replace(',','.');
-  const n = parseFloat(v);
-  META.overrides = META.overrides || {};
-  META.overrides[presuMes] = META.overrides[presuMes] || {};
-  if (valor.trim()==='' || isNaN(n)) delete META.overrides[presuMes][catId];
-  else META.overrides[presuMes][catId] = Math.round(n);
-  if (!Object.keys(META.overrides[presuMes]).length) delete META.overrides[presuMes];
-  await guardarConfig(); render();
-}
-async function quitarOverride(catId){
-  if (META.overrides && META.overrides[presuMes]){ delete META.overrides[presuMes][catId];
-    if (!Object.keys(META.overrides[presuMes]).length) delete META.overrides[presuMes]; }
-  await guardarConfig(); render();
-}
-async function fijarPlan(catId, valor){
-  const c = catById(catId); if(!c) return;
-  const v = valor.trim().replace(/[^\d.,-]/g,'').replace(/\./g,'').replace(',','.');
-  const n = parseFloat(v);
-  if (valor.trim()==='' || isNaN(n)){ c.planManual = null; }
-  else { c.planManual = Math.round(n); }
-  c.planMes = planEfectivo(c); // mantiene compatibilidad con el resumen
-  await guardarConfig();
-  render();
-}
-async function quitarPlan(catId){
-  const c = catById(catId); if(!c) return;
-  c.planManual = null; c.planMes = planEfectivo(c);
-  await guardarConfig(); render();
-}
-async function recalcularYGuardar(){
-  const n = recalcularPlanes();
-  for (const c of CATS) c.planMes = planEfectivo(c);
-  await guardarConfig();
-  alert('Plan calculado actualizado para '+n+' categorías desde tus últimos 12 meses.');
-  render();
-}
-
-function vBandeja(){
-  const total = bandeja().length;
-  if (!total){ $('#main').innerHTML='<div class="vacio">Bandeja vacía. Todo está clasificado y revisado.</div>'; return; }
-  const cabecera = `
-    <h2 class="seccion">Bandeja de revisión <span class="muted micro">(${total} movimientos)</span></h2>
-    <div class="filtros">
-      <button class="btn ${bandejaModo==='grupos'?'':'sec'}" onclick="bandejaModo='grupos';render()">Agrupados</button>
-      <button class="btn ${bandejaModo==='lista'?'':'sec'}" onclick="bandejaModo='lista';render()">Uno a uno</button>
-    </div>`;
-  if (bandejaModo==='grupos'){ vBandejaGrupos(cabecera); } else { vBandejaLista(cabecera); }
-}
-
-function vBandejaGrupos(cabecera){
-  const gs = gruposBandeja();
-  $('#main').innerHTML = cabecera + `
-    <p class="micro muted" style="margin:0 4px 12px">${gs.length} conceptos. Asignar clasifica todos los movimientos del grupo de una vez; si además marcas la regla, los futuros se clasificarán solos.</p>
-    ${gs.map((g,gi)=>{
-      const notas = g.tipo==='persona'
-        ? [...new Set(g.movs.map(m=>(m.descripcion||'').split('|')[0].trim()).filter(s=>s && !s.includes(';') && !/^\d+$/.test(s)))].slice(0,3)
-        : [];
-      const sugerida = g.tipo==='persona' ? g.clave.toLowerCase() : g.clave.toLowerCase().slice(0,30).trim();
-      const reglaOk = claveValida(sugerida, REGLAS).ok && g.clave!=='Compra con tarjeta sin comercio';
-      return `<div class="bandeja-item">
-        <div class="row">
-          <span><strong>${esc(g.clave)}</strong> ${g.tipo==='persona'?'<span class="pill">Bizum</span>':''}</span>
-          <span class="mono">${fmtEUR(g.total)}</span>
-        </div>
-        <div class="tiny muted">${g.movs.length} movimiento${g.movs.length>1?'s':''} · ${g.movs[0].fecha.slice(0,7)} → ${g.movs[g.movs.length-1].fecha.slice(0,7)}${notas.length?` · ${esc(notas.join(' / '))}`:''}</div>
-        <div class="acciones">
-          <select id="gsel-${gi}">${['<option value="">Elige categoría…</option>'].concat(agrupaOpciones('')).join('')}</select>
-          <button class="btn" onclick="asignarGrupo(${gi})">Asignar (${g.movs.length})</button>
-        </div>
-        ${reglaOk?`<label class="tiny muted" style="display:flex;gap:6px;align-items:center;margin-top:8px;cursor:pointer">
-          <input type="checkbox" id="gregla-${gi}" checked style="width:auto"> Recordar regla: <span class="mono">"${esc(sugerida)}"</span>
-        </label>`:''}
-      </div>`;
-    }).join('')}`;
-  window.__grupos = gs;
-}
-
-async function asignarGrupo(gi){
-  const g = window.__grupos[gi];
-  const sel = document.getElementById('gsel-'+gi);
-  if (!g || !sel.value) return;
-  const cat = sel.value, fl = flujoDe(cat);
-  for (const m of g.movs){ m.categoriaId=cat; m.via='manual'; m.revisado=true; m.flujo=fl; }
-  await dbPutAll(g.movs);
-  const chk = document.getElementById('gregla-'+gi);
-  if (chk && chk.checked){
-    const clave = (g.tipo==='persona' ? g.clave : g.clave.slice(0,30)).toLowerCase().trim();
-    const v = claveValida(clave, REGLAS);
-    if (v.ok){
-      REGLAS.comercios[v.clave] = cat; guardarConfig();
-      const extra=[];
-      for (const x of MOVS){
-        if (x.via==='manual') continue;
-        if ((x.descripcion||'').toLowerCase().includes(v.clave)){ x.categoriaId=cat; x.via='dict'; x.flujo=fl; x.revisado=true; extra.push(x); }
-      }
-      if (extra.length) await dbPutAll(extra);
-    }
-  }
-  render();
-}
-
-function vBandejaLista(cabecera){
-  const items = bandeja().slice(0,60);
-  const total = bandeja().length;
-  $('#main').innerHTML = cabecera + `
-    ${items.map(m=>{
-      const con = conceptoDe(m);
-      return `<div class="bandeja-item" id="bi-${cssId(m.id)}">
-        <div class="row"><span class="micro muted">${fmtDia(m.fecha)} ${m.fecha.slice(0,4)}${con.tipo==='persona'?' · <span class="pill">Bizum</span>':''}</span>
-          <span class="mono ${m.importe>0?'pos':'neg'}">${fmtEUR2(m.importe)}</span></div>
-        <div style="margin:4px 0 2px"><strong>${esc(con.clave)}</strong></div>
-        <div class="tiny muted truncate">${esc(m.descripcion)}</div>
-        <div class="acciones">
-          <select id="sel-${cssId(m.id)}">${['<option value="">Elige categoría…</option>'].concat(agrupaOpciones(m.categoriaId)).join('')}</select>
-          <button class="btn" onclick="asignarDesdeBandeja('${m.id}')">Asignar</button>
-        </div>
-        <div id="regla-${cssId(m.id)}"></div>
-      </div>`;
-    }).join('')}
-    ${total>60?`<div class="vacio micro">Mostrando 60 de ${total}. Se irán liberando según revises.</div>`:''}`;
-}
-const cssId = id => id.replace(/[^a-zA-Z0-9]/g,'_');
-
-async function asignarDesdeBandeja(id){
-  const m = MOVS.find(x=>x.id===id);
-  const sel = document.getElementById('sel-'+cssId(id));
-  if (!m || !sel.value) return;
-  m.categoriaId = sel.value; m.via='manual'; m.revisado=true; m.flujo=flujoDe(sel.value);
-  await dbPutAll([m]);
-  const con = conceptoDe(m);
-  const sugerida = (con.tipo==='persona' ? con.clave : con.clave.slice(0,30)).toLowerCase().trim();
-  const valida = claveValida(sugerida, REGLAS).ok;
-  const box = document.getElementById('regla-'+cssId(id));
-  box.innerHTML = valida ? `<div class="regla-box">
-    <span class="tiny muted">Recordar "${esc(sugerida)}" como ${esc(catById(sel.value)?.nombre||'')}:</span>
-    <input type="text" id="clave-${cssId(id)}" value="${esc(sugerida)}">
-    <button class="btn sec" onclick="guardarRegla('${id}')">Recordar</button>
-    <button class="btn sec" onclick="render()">Omitir</button>
-  </div>` : `<div class="tiny muted" style="margin-top:6px">Asignado. (No se sugiere regla porque el concepto es demasiado genérico.)</div>`;
-}
-async function guardarRegla(id){
-  const m = MOVS.find(x=>x.id===id);
-  const inp = document.getElementById('clave-'+cssId(id));
-  const v = claveValida(inp.value, REGLAS);
-  if (!v.ok){ alert(v.motivo); return; }
-  REGLAS.comercios[v.clave] = m.categoriaId;
-  guardarConfig();
-  // reaplica a todos los no manuales que coincidan
-  const afectados=[];
-  for (const x of MOVS){
-    if (x.via==='manual') continue;
-    if ((x.descripcion||'').toLowerCase().includes(v.clave)){
-      x.categoriaId=m.categoriaId; x.via='dict'; x.flujo=flujoDe(m.categoriaId); x.revisado=true;
-      afectados.push(x);
-    }
-  }
-  if (afectados.length) await dbPutAll(afectados);
-  renderTrasBandeja(afectados.length);
-}
-function renderTrasBandeja(n){ render(); }
-
-function vImportar(){
-  $('#main').innerHTML = `
-    <h2 class="seccion">Importar extracto</h2>
-    <div class="drop" id="drop" onclick="document.getElementById('fich').click()">
-      Arrastra aquí el fichero del banco<br><span class="tiny">Extracto completo (TT…XLS) o Movimientos de cuenta</span>
-    </div>
-    <input type="file" id="fich" accept=".xls,.xlsx" style="display:none" onchange="onFichero(this.files)">
-    <div id="resultado"></div>
-    <p class="micro muted" style="padding:0 4px">Puedes subir extractos solapados sin miedo: los movimientos ya cargados se detectan por fecha, importe y saldo, y se ignoran. Si el extracto completo trae más detalle de un movimiento ya cargado, lo enriquece.</p>`;
-  const dz = $('#drop');
-  dz.ondragover = e=>{e.preventDefault(); dz.classList.add('over');};
-  dz.ondragleave = ()=>dz.classList.remove('over');
-  dz.ondrop = e=>{e.preventDefault(); dz.classList.remove('over'); onFichero(e.dataTransfer.files);};
-}
-async function onFichero(files){
-  if (!files || !files.length) return;
-  $('#resultado').innerHTML = '<div class="card muted micro">Leyendo…</div>';
-  const partes=[];
-  for (const f of files){
-    try{
-      const r = await importarFichero(f);
-      if (r.error){ partes.push(`<div class="card"><strong>${esc(f.name)}</strong><div class="micro neg">${esc(r.error)}</div></div>`); continue; }
-      partes.push(`<div class="card"><strong>${esc(f.name)}</strong> <span class="pill">${r.formato==='TT'?'extracto completo':'movimientos cuenta'}</span>
-        <table class="resultado" style="margin-top:6px">
-          <tr><td>Movimientos en el fichero</td><td class="mono">${r.total}</td></tr>
-          <tr><td>Nuevos incorporados</td><td class="mono pos">${r.nuevos}</td></tr>
-          <tr><td>Ya existían (ignorados)</td><td class="mono muted">${r.dups}</td></tr>
-          ${r.enriquecidos?`<tr><td>Enriquecidos con más detalle</td><td class="mono">${r.enriquecidos}</td></tr>`:''}
-          <tr><td>Pendientes de clasificar</td><td class="mono ${r.sinCat?'neg':'pos'}">${r.sinCat}</td></tr>
-        </table></div>`);
-    }catch(err){ partes.push(`<div class="card"><strong>${esc(f.name)}</strong><div class="micro neg">Error al leer: ${esc(err.message)}</div></div>`); }
-  }
-  $('#resultado').innerHTML = partes.join('');
-  renderNav();
-}
-
-function vAjustes(){
-  const nMan = MOVS.filter(m=>m.via==='manual').length;
-  $('#main').innerHTML = `
-    <h2 class="seccion">Datos</h2>
-    <div class="card">
-      <table class="resultado">
-        <tr><td>Movimientos</td><td class="mono">${MOVS.length}</td></tr>
-        <tr><td>Periodo</td><td class="mono">${MOVS.length?meses()[0]+' → '+meses().slice(-1)[0]:'—'}</td></tr>
-        <tr><td>Comercios en el diccionario</td><td class="mono">${Object.keys(REGLAS.comercios).length}</td></tr>
-        <tr><td>Correcciones manuales</td><td class="mono">${nMan}</td></tr>
-        <tr><td>Última importación</td><td class="mono tiny">${META.ultimaImportacion?META.ultimaImportacion.slice(0,16).replace('T',' '):'—'}</td></tr>
-      </table>
-    </div>
-    <h2 class="seccion">Datos privados</h2>
-    <div class="card">
-      <p class="micro muted" style="margin-top:0">Los nombres de personas y tus cuentas no viajan en el código (que es público). ${REGLAS.nombresPropios&&REGLAS.nombresPropios.length ? 'Ya están cargados en esta casa.' : 'Cárgalos una vez con el fichero <span class="mono">datos_privados.js</span> que te entregaron; se guardarán en Firestore y no habrá que repetirlo.'}</p>
-      ${REGLAS.nombresPropios&&REGLAS.nombresPropios.length ? '<span class="pill">cargados</span>' : `<button class="btn" onclick="document.getElementById('fichpriv').click()">Cargar datos privados</button>
-      <input type="file" id="fichpriv" accept=".js,.json" style="display:none" onchange="cargarPrivados(this.files)">`}
-    </div>
-    <h2 class="seccion">Cuentas y nombres propios</h2>
-    <div class="card">
-      <p class="micro muted" style="margin-top:0">Se usan para reconocer traspasos entre tus propias cuentas (y no confundirlos con gastos), y tienen prioridad sobre comercios y palabras clave. Toca un elemento para quitarlo.</p>
-      ${['cuentasAhorro','cuentasPropias','nombresPropios'].map(campo=>`
-        <div style="margin-bottom:14px">
-          <label style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);display:block;margin-bottom:6px">${etiquetaCampoPropio(campo)}</label>
-          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px">
-            ${(REGLAS[campo]||[]).length ? (REGLAS[campo]||[]).map(v=>`<span class="pill" data-campo="${campo}" data-valor="${esc(v)}" onclick="quitarPropio(this)" style="cursor:pointer" title="Tocar para quitar">${esc(v)} ✕</span>`).join('') : '<span class="tiny muted">Ninguno todavía.</span>'}
-          </div>
-          <div style="display:flex;gap:8px">
-            <input type="text" id="in-${campo}" placeholder="Añadir…" onkeydown="if(event.key==='Enter'){anadirPropio('${campo}')}">
-            <button class="btn sec" onclick="anadirPropio('${campo}')">Añadir</button>
-          </div>
-        </div>`).join('')}
-    </div>
-    <h2 class="seccion">Copia de seguridad</h2>
-    <div class="card">
-      <p class="micro muted" style="margin-top:0">La copia incluye movimientos, categorías, reglas aprendidas y configuración. Guárdala donde quieras; se restaura desde aquí mismo.</p>
-      <button class="btn" onclick="exportarBackup()">Descargar copia</button>
-      <button class="btn sec" onclick="document.getElementById('fichbk').click()">Restaurar copia</button>
-      <input type="file" id="fichbk" accept=".json" style="display:none" onchange="restaurarBackup(this.files)">
-    </div>
-    <h2 class="seccion">Zona delicada</h2>
-    <div class="card">
-      <button class="btn peligro" onclick="borrarTodo()">Borrar todos los datos</button>
-      <button class="btn sec" onclick="recategorizarTodo()">Recategorizar (respeta manuales)</button>
-    </div>`;
-}
-function etiquetaCampoPropio(campo){
-  return {
-    cuentasAhorro: 'Cuentas de ahorro propias (categoría Ahorro)',
-    cuentasPropias: 'Otras cuentas propias (categoría Traspasos)',
-    nombresPropios: 'Nombres propios / familiares (categoría Traspasos)'
-  }[campo] || campo;
-}
-async function anadirPropio(campo){
-  const input = document.getElementById('in-'+campo); if (!input) return;
-  const v = (input.value||'').trim();
-  if (!v) return;
-  REGLAS[campo] = REGLAS[campo] || [];
-  if (!REGLAS[campo].some(x=>x.toLowerCase()===v.toLowerCase())) REGLAS[campo].push(v);
-  input.value = '';
-  await guardarConfig();
-  await recategorizarTodo();
-}
-async function quitarPropio(el){
-  const campo = el.dataset.campo, valor = el.dataset.valor;
-  if (!confirm('¿Quitar "'+valor+'" de '+etiquetaCampoPropio(campo)+'?')) return;
-  REGLAS[campo] = (REGLAS[campo]||[]).filter(x=>x!==valor);
-  await guardarConfig();
-  await recategorizarTodo();
-}
-async function cargarPrivados(files){
-  if (!files || !files.length) return;
-  try{
-    const txt = await files[0].text();
-    let datos;
-    // admite tanto el .js (window.DATOS_PRIVADOS = {...};) como un .json plano
-    const m = txt.match(/window\.DATOS_PRIVADOS\s*=\s*(\{[\s\S]*\})\s*;?/);
-    datos = JSON.parse(m ? m[1] : txt);
-    if (!datos || !datos.comercios) throw new Error('El fichero no tiene el formato esperado.');
-    Object.assign(REGLAS.comercios, datos.comercios||{});
-    for (const campo of ['cuentasAhorro','cuentasPropias','nombresPropios'])
-      REGLAS[campo] = [...new Set([...(REGLAS[campo]||[]), ...((datos[campo])||[])])];
-    for (const [cat,kws] of (datos.palabrasClave||[])){
-      const ex = REGLAS.palabrasClave.find(r=>r[0]===cat);
-      if (ex) ex[1].push(...kws.filter(k=>!ex[1].includes(k))); else REGLAS.palabrasClave.push([cat,kws]);
-    }
-    META.privadosCargados = true;
-    await guardarConfig();
-    // recategoriza lo no manual con las nuevas reglas privadas
-    const afectados=[];
-    for (const x of MOVS){ if (x.via==='manual') continue; const antes=x.categoriaId; aplicarCategoria(x); if (x.categoriaId!==antes) afectados.push(x); }
-    if (afectados.length) await dbPutAll(afectados);
-    alert('Datos privados cargados y guardados en Firestore. '+afectados.length+' movimientos recategorizados.');
-    render();
-  }catch(e){ alert('No se pudieron cargar: '+e.message); }
-}
-function exportarBackup(){
-  const data = {version:1, exportado:new Date().toISOString(), meta:META, categorias:CATS, reglas:REGLAS, movimientos:MOVS};
-  const blob = new Blob([JSON.stringify(data)],{type:'application/json'});
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'economia-casa-backup-'+new Date().toISOString().slice(0,10)+'.json';
-  a.click(); URL.revokeObjectURL(a.href);
-}
-async function restaurarBackup(files){
-  if (!files.length) return;
-  try{
-    const data = JSON.parse(await files[0].text());
-    if (!data.movimientos || !data.categorias) throw new Error('El fichero no parece una copia de esta herramienta.');
-    if (!confirm(`La copia tiene ${data.movimientos.length} movimientos. Sustituirá todo lo actual. ¿Continuar?`)) return;
-    await dbClear();
-    MOVS = data.movimientos; CATS = data.categorias; REGLAS = data.reglas; META = data.meta||META;
-    await dbPutAll(MOVS); guardarConfig(); render();
-  }catch(err){ alert('No se pudo restaurar: '+err.message); }
-}
-async function borrarTodo(){
-  if (!confirm('Se borrarán todos los movimientos y reglas aprendidas. ¿Seguro?')) return;
-  if (!confirm('Última confirmación: esta acción no se puede deshacer sin una copia de seguridad.')) return;
-  await dbClear(); localStorage.removeItem(LS.cats); localStorage.removeItem(LS.reglas); localStorage.removeItem(LS.meta);
-  MOVS=[]; cargarConfig(); render();
-}
-async function recategorizarTodo(){
-  const afectados=[];
-  for (const m of MOVS){ if (m.via==='manual') continue; const antes=m.categoriaId; aplicarCategoria(m); if(m.categoriaId!==antes) afectados.push(m); }
-  if (afectados.length) await dbPutAll(afectados);
-  alert(afectados.length+' movimientos han cambiado de categoría.');
-  render();
-}
-
-/* ============ HOJA DE EDICIÓN ============ */
-function abrirHoja(id){
-  const m = MOVS.find(x=>x.id===id); if(!m) return;
-  const concepto = conceptoDe(m);
-  const claveProp = (concepto.tipo==='persona'?concepto.clave:concepto.clave.slice(0,30)).toLowerCase().trim();
-  const valida = claveValida(claveProp, REGLAS).ok;
-  const similares = valida ? MOVS.filter(x=>x.id!==id && (x.descripcion||'').toLowerCase().includes(claveProp)) : [];
-  const nAuto = similares.filter(x=>x.via!=='manual').length;
-  const nMan = similares.length - nAuto;
-  $('#velo').style.display='block';
-  const h = $('#hoja'); h.style.display='block';
-  h.dataset.clave = claveProp;
-  h.innerHTML = `
-    <h3>${esc(descCorta(m))}</h3>
-    <div class="micro muted">${fmtDia(m.fecha)} ${m.fecha.slice(0,4)} · <span class="mono ${m.importe>0?'pos':'neg'}">${fmtEUR2(m.importe)}</span>${m.saldo!=null?` · saldo ${fmtEUR2(m.saldo)}`:''}</div>
-    <div class="tiny muted" style="margin-top:6px;word-break:break-word">${esc(m.descripcion)}</div>
-    <div class="campo"><label for="h-cat">Categoría</label>
-      <select id="h-cat" onchange="refrescarPropagar()">${['<option value="">Sin clasificar</option>'].concat(agrupaOpciones(m.categoriaId)).join('')}</select></div>
-    <div id="h-prop-wrap" data-nauto="${nAuto}" data-nman="${nMan}" data-catini="${m.categoriaId||''}"></div>
-    <div class="campo"><label for="h-nota">Nota</label>
-      <input type="text" id="h-nota" value="${esc(m.nota||'')}" placeholder="Opcional"></div>
-    <div class="campo" style="display:flex;gap:8px">
-      <button class="btn" onclick="guardarHoja('${m.id}')">Guardar</button>
-      <button class="btn sec" onclick="cerrarHoja()">Cancelar</button>
-    </div>`;
-  refrescarPropagar();
-}
-function refrescarPropagar(){
-  const wrap = $('#h-prop-wrap'); if(!wrap) return;
-  const nAuto = +wrap.dataset.nauto, nMan = +wrap.dataset.nman;
-  const cat = document.getElementById('h-cat').value;
-  const cambia = cat && cat !== wrap.dataset.catini;
-  const total = nAuto + nMan;
-  if (!cambia || total===0){ wrap.innerHTML=''; return; }
-  const nom = catById(cat)?.nombre || '';
-  wrap.innerHTML = `<div class="regla-box" style="flex-direction:column;align-items:stretch;gap:8px">
-    <label class="micro" style="display:flex;gap:8px;align-items:flex-start;cursor:pointer">
-      <input type="checkbox" id="h-prop" style="width:auto;margin-top:2px">
-      <span>Aplicar también a <strong>${total}</strong> movimiento${total>1?'s':''} igual${total>1?'es':''} (<span class="mono">"${esc($('#hoja').dataset.clave)}"</span>) → ${esc(nom)}, y recordar la regla${nMan?`. <span class="muted">Incluye ${nMan} que ya ajustaste a mano; se sobrescribirán.</span>`:'.'}</span>
-    </label>
-  </div>`;
-}
-async function guardarHoja(id){
-  const m = MOVS.find(x=>x.id===id); if(!m) return;
-  const cat = document.getElementById('h-cat').value || null;
-  const catCambia = cat !== m.categoriaId;
-  if (catCambia){ m.categoriaId=cat; m.via = cat?'manual':null; m.flujo = cat?flujoDe(cat):'real'; m.revisado=!!cat; }
-  m.nota = document.getElementById('h-nota').value;
-  const guardar = [m];
-  const prop = document.getElementById('h-prop');
-  if (cat && catCambia && prop && prop.checked){
-    const clave = $('#hoja').dataset.clave;
-    const v = claveValida(clave, REGLAS);
-    if (v.ok){
-      REGLAS.comercios[v.clave] = cat; guardarConfig();
-      const fl = flujoDe(cat);
-      for (const x of MOVS){
-        if (x.id===id) continue;
-        if ((x.descripcion||'').toLowerCase().includes(v.clave)){ x.categoriaId=cat; x.via='dict'; x.flujo=fl; x.revisado=true; guardar.push(x); }
-      }
-    }
-  }
-  await dbPutAll(guardar);
-  cerrarHoja(); render();
-}
-function cerrarHoja(){ $('#velo').style.display='none'; $('#hoja').style.display='none'; }
-
-/* ============ LOGIN Y ARRANQUE ============ */
-async function hacerLogin(){
-  const mail = document.getElementById('lg-mail').value.trim();
-  const pass = document.getElementById('lg-pass').value;
-  const err = document.getElementById('lg-err');
-  const btn = document.getElementById('lg-btn');
-  err.textContent=''; btn.disabled=true; btn.textContent='Entrando…';
-  try {
-    await AUTH.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
-    await AUTH.signInWithEmailAndPassword(mail, pass);
-    // el observador onAuthStateChanged se encarga del resto
-  } catch(e){
-    const msg = {
-      'auth/invalid-email':'Correo no válido.',
-      'auth/invalid-credential':'Correo o contraseña incorrectos.',
-      'auth/wrong-password':'Correo o contraseña incorrectos.',
-      'auth/user-not-found':'Correo o contraseña incorrectos.',
-      'auth/too-many-requests':'Demasiados intentos. Espera un momento.',
-      'auth/network-request-failed':'Sin conexión. Revisa tu red.'
-    }[e.code] || ('No se pudo entrar ('+e.code+').');
-    err.textContent = msg;
-  } finally { btn.disabled=false; btn.textContent='Entrar'; }
-}
-async function cerrarSesion(){ localStorage.removeItem(LS_ACTIVIDAD); await AUTH.signOut(); location.reload(); }
-
-/* ---- Caducidad de sesión por inactividad (1 hora) ----
-   Pasada una hora sin interacción con la app, se cierra la sesión y hay que volver a
-   meter usuario y contraseña. Se guarda la marca de tiempo en localStorage (no en Firestore)
-   para que sobreviva a recargas y a cerrar/abrir la app. */
-const SESION_MAX_MS = 60*60*1000;
-const LS_ACTIVIDAD = 'eco.ultimaActividad';
-let sesionCaducando = false;
-function marcarActividad(){ try{ localStorage.setItem(LS_ACTIVIDAD, String(Date.now())); }catch(e){} }
-function sesionCaducada(){
-  const v = +(localStorage.getItem(LS_ACTIVIDAD)||0);
-  return v>0 && (Date.now()-v) > SESION_MAX_MS;
-}
-async function comprobarCaducidadSesion(){
-  if (!UID || sesionCaducando) return;
-  if (sesionCaducada()){
-    sesionCaducando = true;
-    localStorage.removeItem(LS_ACTIVIDAD);
-    await AUTH.signOut();
-    alert('Tu sesión ha caducado por inactividad. Vuelve a entrar con tu usuario y contraseña.');
-    location.reload();
-  }
-}
-['click','keydown','touchstart','pointerdown'].forEach(ev=>document.addEventListener(ev, marcarActividad, {passive:true}));
-document.addEventListener('visibilitychange', ()=>{ if (document.visibilityState==='visible') comprobarCaducidadSesion(); });
-setInterval(comprobarCaducidadSesion, 60*1000);
-
-function mostrarLogin(){ document.getElementById('login').style.display='flex'; document.getElementById('app').style.display='none'; }
-// saludo amable con el nombre antes de la @ y emoji según la hora
-function saludoTexto(email){
-  const nombre = (email||'').split('@')[0].split(/[._-]/)[0];
-  const cap = nombre ? nombre.charAt(0).toUpperCase()+nombre.slice(1) : '';
-  const h = new Date().getHours();
-  const emoji = h<6?'🌙':h<13?'☀️':h<21?'👋':'🌙';
-  return `Hola ${esc(cap)} ${emoji}`;
-}
-
-AUTH.onAuthStateChanged(async user => {
-  if (!user){ mostrarLogin(); return; }
-  // si la sesión llevaba más de una hora sin actividad (p.ej. la app estuvo cerrada o en
-  // segundo plano), se cierra aquí mismo antes de mostrar nada; onAuthStateChanged volverá
-  // a dispararse con user=null y aparecerá la pantalla de login.
-  if (sesionCaducada()){
-    localStorage.removeItem(LS_ACTIVIDAD);
-    await AUTH.signOut();
-    return;
-  }
-  marcarActividad();
-  UID = user.uid;
-  document.getElementById('login').style.display='none';
-  document.getElementById('app').style.display='block';
-  document.getElementById('topbar').innerHTML =
-    `<div><h1>Economía de casa</h1><div class="saludo">${saludoTexto(user.email)} · <button class="salir" onclick="cerrarSesion()">salir</button></div></div>`;
-  try {
-    DB = await abrirDB();
-    await cargarConfig();
-    MOVS = await cacheGetAll();
+    MOVS = await cacheGetAll(); reindexMovs();
     render();                    // arranque instantáneo desde la caché local
     if (seedActualizada && MOVS.length){
       const afectados=[];
