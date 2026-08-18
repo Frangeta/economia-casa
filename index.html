@@ -601,15 +601,24 @@ function planEfectivo(c, ym){
 function tieneOverride(catId, ym){ return !!(META.overrides && META.overrides[ym] && META.overrides[ym][catId]!=null); }
 // Recalcula planCalc de cada categoría de gasto desde los últimos 12 meses de movimientos.
 // mediana: mediana de los totales mensuales (gastos estables). anualizado: total 12m / 12 (gastos irregulares).
-function recalcularPlanes(){
+// ventana de los 12 meses cerrados que se usa como base para todos los cálculos de plan
+// (gastos, ingresos y flujos internos), reutilizable fuera de recalcularPlanes
+function ventanaBase(){
   const ms = meses();
-  if (!ms.length) return 0;
-  const ultimo = ms[ms.length-1];
-  // ventana de los 12 meses hasta el último con datos (excluye el mes en curso si está incompleto)
+  if (!ms.length) return [];
   const idxUlt = ms.length-1;
   const ventana = ms.slice(Math.max(0, idxUlt-12), idxUlt); // 12 meses cerrados anteriores al último
   const usar = ventana.length>=6 ? ventana : ms.slice(0, idxUlt).slice(-12); // fallback si hay poco histórico
-  const base = usar.length ? usar : ms;
+  return usar.length ? usar : ms;
+}
+function mediana(arr){
+  const orden = [...arr].sort((a,b)=>a-b);
+  const mid = Math.floor(orden.length/2);
+  return orden.length%2 ? orden[mid] : (orden[mid-1]+orden[mid])/2;
+}
+function recalcularPlanes(){
+  const base = ventanaBase();
+  if (!base.length) return 0;
   // acumula neto por categoría y mes (gasto/interno = suma de -importe, positivo si sale de
   // la cuenta; ingreso = suma de +importe)
   const porCatMes = {};
@@ -625,18 +634,29 @@ function recalcularPlanes(){
   for (const c of CATS){
     if (c.tipo!=='gasto' && c.tipo!=='ingreso' && c.tipo!=='interno') continue;
     const serie = base.map(ym => (porCatMes[c.id] && porCatMes[c.id][ym]) || 0);
-    let val;
-    if (c.metodoBase==='anualizado'){
-      val = serie.reduce((a,b)=>a+b,0) / base.length; // media mensual (suave para irregulares)
-    } else {
-      const orden = [...serie].sort((a,b)=>a-b);
-      const mid = Math.floor(orden.length/2);
-      val = orden.length%2 ? orden[mid] : (orden[mid-1]+orden[mid])/2; // mediana
-    }
+    const val = c.metodoBase==='anualizado'
+      ? serie.reduce((a,b)=>a+b,0) / base.length   // media mensual (suave para irregulares)
+      : mediana(serie);
     c.planCalc = Math.round(val);
     n++;
   }
   return n;
+}
+// referencia histórica de cuánto SALE y cuánto ENTRA en una categoría de flujo interno
+// (mediana mensual sobre la misma ventana de 12 meses que usa el plan calculado). Es solo
+// informativo, para entender de qué se compone el neto ajustable de esa categoría.
+function historicoSalidaEntrada(catId){
+  const base = ventanaBase();
+  if (!base.length) return {sale:0, entra:0};
+  const porMesSale={}, porMesEntra={};
+  for (const m of MOVS){
+    if (m.categoriaId!==catId || !base.includes(m.ym)) continue;
+    if (m.importe<0) porMesSale[m.ym] = (porMesSale[m.ym]||0) + (-m.importe);
+    else porMesEntra[m.ym] = (porMesEntra[m.ym]||0) + m.importe;
+  }
+  const sale = mediana(base.map(ym=>porMesSale[ym]||0));
+  const entra = mediana(base.map(ym=>porMesEntra[ym]||0));
+  return {sale:r2(sale), entra:r2(entra)};
 }
 
 /* Previsión del mes: previsto (plan vigente) vs real, en ingresos, gastos y balance */
@@ -1588,6 +1608,12 @@ function vPresupuesto(){
   for (const c of internoCats){ totInternoEfect += planEfectivo(c,modoMes); if(modoMes?tieneOverride(c.id,modoMes):c.planManual!=null) nAjustesInterno++; }
   const salidaTotal = r2(totEfect + totInternoEfect);      // todo lo que sale de la cuenta: gasto + traspasos
   const disponible = r2(ingEfect - totEfect - totInternoEfect); // lo que te queda tras gasto Y traspasos
+  // referencia histórica (mediana de los últimos 12 meses) de cuánto sale y cuánto vuelve en
+  // conjunto en los flujos internos, para poder entender de qué se compone la diferencia
+  const refInterno = internoCats.reduce((acc,c)=>{
+    const h = historicoSalidaEntrada(c.id);
+    acc.sale += h.sale; acc.entra += h.entra; return acc;
+  }, {sale:0, entra:0});
 
   const filaCat = c => {
     if (modoMes){
@@ -1643,6 +1669,17 @@ function vPresupuesto(){
     </div>
     ${!modoMes?`<p class="micro muted" style="margin:0 4px 12px">El plan calculado sale de la mediana (o media, en categorías irregulares) de tus últimos 12 meses. Fija un valor a mano si sabes que será distinto. Esto alimenta la previsión vs real del Resumen.</p>`:''}
 
+    ${internoCats.length?`<div class="card" style="padding:12px 14px">
+      <div class="micro muted">Traspaso a tus cuentas propias <span class="tiny">(no es gasto, pero sale de la cuenta)</span></div>
+      <div class="row" style="margin-top:8px"><span class="tiny muted">Suele salir de la cuenta</span><span class="mono neg">-${fmtEUR(refInterno.sale)}</span></div>
+      <div class="row" style="margin-top:3px"><span class="tiny muted">Suele volver</span><span class="mono pos">+${fmtEUR(refInterno.entra)}</span></div>
+      <div class="row" style="margin-top:6px;padding-top:8px;border-top:1px solid var(--line)">
+        <span class="micro"><strong>Diferencia prevista${modoMes?` (${nombreMesLargo(modoMes)})`:''}</strong></span>
+        <span class="mono" style="font-weight:600;color:var(--interno)">${totInternoEfect>=0?'-':'+'}${fmtEUR(Math.abs(totInternoEfect))}</span>
+      </div>
+      <p class="tiny muted" style="margin:8px 0 0">"Sale" y "vuelve" son la mediana de tus últimos 12 meses, para que entiendas de qué se compone. La diferencia es la cifra que realmente se usa en "Lo que te queda" más abajo — ajústala en <strong>Traspasos a tus cuentas</strong> si este ${modoMes?'mes':'periodo'} vas a mover más o menos.${nAjustesInterno?` Ahora mismo tienes ${nAjustesInterno} ajuste${nAjustesInterno>1?'s':''} a mano.`:''}</p>
+    </div>`:''}
+
     <h2 class="seccion" style="margin-top:8px">Ingresos esperados</h2>
     <div class="card" style="padding:12px 14px">
       ${ingCats.map(filaCat).join('')}
@@ -1662,7 +1699,10 @@ function vPresupuesto(){
     ${internoCats.length?`<h2 class="seccion">Traspasos a tus cuentas <span class="tiny muted">(no es gasto, pero sale de la cuenta)</span></h2>
     <div class="card" style="padding:12px 14px">
       <p class="micro muted" style="margin-top:0">Cuánto planeas mover a ahorro u otras cuentas propias. Se calcula igual que el resto (mediana de los últimos 12 meses) y puedes ajustarlo aquí abajo para ver cómo cambia lo que te queda disponible si traspasas más o menos.${nAjustesInterno?` <strong>${nAjustesInterno} ajuste${nAjustesInterno>1?'s':''}${modoMes?' este mes':''}.</strong>`:''}</p>
-      ${internoCats.map(filaCat).join('')}
+      ${internoCats.map(c=>{
+        const h = historicoSalidaEntrada(c.id);
+        return filaCat(c) + `<div class="tiny muted" style="margin:-6px 0 10px 2px">sale ${fmtEUR(h.sale)} · entra ${fmtEUR(h.entra)} <span class="micro">(mediana histórica)</span></div>`;
+      }).join('')}
       <div class="row" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
         <span class="micro muted">Total que sale de la cuenta <span class="tiny">(gasto + traspasos)</span></span>
         <span class="mono neg">${fmtEUR(salidaTotal)}</span>
