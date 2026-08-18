@@ -664,6 +664,7 @@ function previsionMes(ym){
   const R = resumenMes(ym);
   const gastoPrev = CATS.filter(c=>c.tipo==='gasto').reduce((s,c)=>s+planEfectivo(c,ym),0);
   const ingPrev   = CATS.filter(c=>c.tipo==='ingreso').reduce((s,c)=>s+planEfectivo(c,ym),0);
+  const internoPrev = CATS.filter(c=>c.tipo==='interno').reduce((s,c)=>s+planEfectivo(c,ym),0);
   // desglose por categoría de gasto: previsto vs real del mes
   const catGasto = CATS.filter(c=>c.tipo==='gasto').map(c=>({
     id:c.id, nombre:c.nombre, grupo:c.grupo,
@@ -674,7 +675,7 @@ function previsionMes(ym){
   return {
     ing:{prev:r2(ingPrev), real:R.ingReal},
     gasto:{prev:r2(gastoPrev), real:R.gasReal},
-    balance:{prev:r2(ingPrev-gastoPrev), real:r2(R.ingReal-R.gasReal)},
+    balance:{prev:r2(ingPrev-gastoPrev-internoPrev), real:R.balance},
     catGasto
   };
 }
@@ -754,7 +755,8 @@ function resumenMes(ym){
     const cid = m.categoriaId||'__null';
     porCat[cid]=(porCat[cid]||0)+gastoNeto;
   }
-  return {ingReal:r2(ingReal), gasReal:r2(gasReal), intIn:r2(intIn), intOut:r2(intOut), porGrupo, porCat, porIng, n:ms.length};
+  return {ingReal:r2(ingReal), gasReal:r2(gasReal), intIn:r2(intIn), intOut:r2(intOut),
+    balance:r2(ingReal-gasReal-(intOut-intIn)), porGrupo, porCat, porIng, n:ms.length};
 }
 const enBandeja = m => m.categoriaId===null || (m.categoriaId==='bizum_env' && !m.revisado);
 const bandeja = () => MOVS.filter(enBandeja).sort((a,b)=>b.fecha.localeCompare(a.fecha));
@@ -831,17 +833,18 @@ function vResumen(){
   if (!ms.length){ $('#main').innerHTML = `<div class="vacio">Aún no hay movimientos.<br>Empieza importando un extracto en la pestaña Importar.</div>`; return; }
   if (!mesSel || !ms.includes(mesSel)) mesSel = ms[ms.length-1];
   // asegura planes calculados (incluye ingresos) para poder mostrar la previsión
-  if (MOVS.length && CATS.some(c=>(c.tipo==='gasto'||c.tipo==='ingreso') && c.planCalc==null)){
+  if (MOVS.length && CATS.some(c=>(c.tipo==='gasto'||c.tipo==='ingreso'||c.tipo==='interno') && c.planCalc==null)){
     recalcularPlanes(); guardarConfig();
   }
   const idx = ms.indexOf(mesSel);
   const R = resumenMes(mesSel);
-  const balance = r2(R.ingReal - R.gasReal);
+  const balance = R.balance; // ya descuenta lo traspasado a otras cuentas propias: esta cuenta se queda sin ese dinero
+  const netoInterno = r2(R.intOut - R.intIn); // positivo = ha salido más de lo que ha vuelto
   const tasa = R.ingReal>0 ? Math.round(balance/R.ingReal*100) : null;
 
-  // cinta: destino de los ingresos del mes
-  const total = Math.max(R.ingReal, R.gasReal+Math.max(balance,0), 1);
-  const wGas = R.gasReal/total*100, wBal = Math.max(balance,0)/total*100;
+  // cinta: destino de los ingresos del mes (gasto + traspasos + lo que queda de balance)
+  const total = Math.max(R.ingReal, R.gasReal + Math.max(netoInterno,0) + Math.max(balance,0), 1);
+  const wGas = R.gasReal/total*100, wTra = Math.max(netoInterno,0)/total*100, wBal = Math.max(balance,0)/total*100;
   const grupos = Object.entries(R.porGrupo).sort((a,b)=>b[1]-a[1]);
   const paleta = ['#A6432D','#C0623F','#CE8155','#D99E72','#E2B891','#EAD1B4','#D6C8A8','#BFB89A'];
   let ci=0;
@@ -861,18 +864,18 @@ function vResumen(){
       <div class="kpi"><div class="ic" style="background:var(--gasto-bg)"><svg style="stroke:var(--gasto)" viewBox="0 0 24 24"><path d="M12 5v14M5 12l7 7 7-7"/></svg></div><div class="lbl">Gasto real</div><div class="val neg">${fmtEUR(R.gasReal)}</div></div>
       <div class="kpi"><div class="ic" style="background:var(--marca-bg)"><svg style="stroke:var(--marca)" viewBox="0 0 24 24"><path d="M3 12h18M12 3v18"/></svg></div><div class="lbl">Balance</div><div class="val" style="color:var(--marca)">${fmtEUR(balance)}</div><div class="sub">${tasa!=null?tasa+'% de ahorro':''}</div></div>
     </div>
-    ${htmlSaldoCuenta(R, balance)}
+    ${htmlComposicionBalance(R, balance, netoInterno)}
     ${htmlComparativaGasto(mesSel)}
     ${htmlPrevision(mesSel)}
     ${htmlAvisos(mesSel)}
     <div class="card">
       <div class="row"><span class="micro muted">En qué se convierte el mes</span><span class="micro muted mono">${fmtEUR(total)}</span></div>
-      <div class="cinta">${segs}${wBal>0?`<div style="width:${wBal}%;background:var(--ingreso)" title="Balance ${fmtEUR(balance)}"></div>`:''}</div>
+      <div class="cinta">${segs}${wTra>0?`<div style="width:${wTra}%;background:var(--interno)" title="Traspasos a otras cuentas propias ${fmtEUR(netoInterno)}"></div>`:''}${wBal>0?`<div style="width:${wBal}%;background:var(--ingreso)" title="Balance ${fmtEUR(balance)}"></div>`:''}</div>
       <div class="leyenda">
         ${grupos.slice(0,4).map(([g],i)=>`<span><span class="dot" style="background:${paleta[i]}"></span>${esc(g)}</span>`).join('')}
+        ${wTra>0?`<span><span class="dot" style="background:var(--interno)"></span>Traspasos</span>`:''}
         ${balance>0?`<span><span class="dot" style="background:var(--ingreso)"></span>Balance</span>`:''}
       </div>
-      ${R.intOut||R.intIn?`<div class="micro muted" style="margin-top:8px">Flujos internos aparte: ${fmtEUR(R.intOut)} salen (ahorro/traspasos)${R.intIn?`, ${fmtEUR(R.intIn)} vuelven`:''}.</div>`:''}
     </div>
     <h2 class="seccion">Gasto por grupo</h2>
     ${grupos.map(([g,v])=>{
@@ -898,19 +901,18 @@ function vResumen(){
     ${htmlFlujosInternos(mesSel)}
   `;
 }
-// El Balance (ingresos - gasto real) es cuánto has ahorrado de verdad este mes: si traspasas
-// parte a otra cuenta propia, sigue siendo tuyo, así que no debe restar del Balance. PERO ese
-// dinero sí ha salido físicamente de la cuenta corriente, así que aquí se muestra por separado
-// cuánto ha cambiado realmente esa cuenta (Balance menos lo traspasado neto).
-function htmlSaldoCuenta(R, balance){
-  const netoInterno = r2(R.intOut - R.intIn); // positivo = ha salido más de lo que ha vuelto
+// El Balance ya descuenta lo traspasado a otras cuentas propias (esta cuenta se queda sin ese
+// dinero, sea cual sea su destino). Esta tarjeta solo explica de qué se compone esa cifra,
+// para que no parezca que "falta" dinero por explicar.
+function htmlComposicionBalance(R, balance, netoInterno){
   if (Math.abs(netoInterno) < 1) return '';
-  const saldoCuenta = r2(balance - netoInterno);
+  const ingMenosGasto = r2(R.ingReal - R.gasReal);
   return `<div class="card" style="padding:12px 14px">
-    <div class="row"><span class="micro muted">Balance (ingresos − gasto real)</span><span class="mono" style="color:var(--marca)">${fmtEUR(balance)}</span></div>
-    <div class="row" style="margin-top:4px"><span class="micro muted">${netoInterno>=0?'− traspasado':'+ recuperado'} a otras cuentas propias</span><span class="mono ${netoInterno>=0?'neg':'pos'}">${netoInterno>=0?'-':'+'}${fmtEUR(Math.abs(netoInterno))}</span></div>
-    <div class="row" style="margin-top:6px;padding-top:8px;border-top:1px solid var(--line)"><span class="micro"><strong>Cambio real en tu cuenta corriente</strong></span><span class="mono" style="font-weight:600;color:${saldoCuenta>=0?'var(--ingreso)':'var(--gasto)'}">${fmtEUR(saldoCuenta)}</span></div>
-    <p class="tiny muted" style="margin:8px 0 0">El Balance sigue siendo dinero tuyo (has ahorrado igual), pero parte ya no está en esta cuenta: se ha movido a ahorro/otra cuenta. Esto de aquí es lo que de verdad ha cambiado el saldo de la cuenta de la que salen tus gastos.</p>
+    <div class="micro muted">Cómo se compone tu Balance</div>
+    <div class="row" style="margin-top:8px"><span class="tiny muted">Ingresos − gasto real</span><span class="mono">${fmtEUR(ingMenosGasto)}</span></div>
+    <div class="row" style="margin-top:3px"><span class="tiny muted">${netoInterno>=0?'− traspasado':'+ recuperado'} a otras cuentas propias</span><span class="mono ${netoInterno>=0?'neg':'pos'}">${netoInterno>=0?'-':'+'}${fmtEUR(Math.abs(netoInterno))}</span></div>
+    <div class="row" style="margin-top:6px;padding-top:8px;border-top:1px solid var(--line)"><span class="micro"><strong>Balance</strong></span><span class="mono" style="font-weight:600;color:var(--marca)">${fmtEUR(balance)}</span></div>
+    <p class="tiny muted" style="margin:8px 0 0">Esta cuenta se queda sin el dinero que traspasas, aunque siga siendo tuyo en otra cuenta — por eso el Balance ya lo tiene descontado.</p>
   </div>`;
 }
 // Comparativa sencilla: gasto de este mes vs el anterior, con una mini-tendencia de los últimos meses
@@ -991,7 +993,7 @@ function htmlFlujosInternos(ym){
   const R = resumenMes(ym);
   return `<h2 class="seccion">Flujos internos <span class="tiny muted">(no cuentan como gasto)</span></h2>
     <div class="card">
-      <p class="micro muted" style="margin-top:0">Ahorro y traspasos entre tus propias cuentas, y devoluciones de compra: mueven dinero pero no afectan a tu gasto ni ingreso real (este mes: ingresos ${fmtEUR(R.ingReal)}, gasto ${fmtEUR(R.gasReal)}). Toca una categoría para ver sus movimientos.</p>
+      <p class="micro muted" style="margin-top:0">Ahorro y traspasos entre tus propias cuentas, y devoluciones de compra: no son gasto ni ingreso real (este mes: ingresos ${fmtEUR(R.ingReal)}, gasto ${fmtEUR(R.gasReal)}), pero sí están descontados del Balance, porque esta cuenta se queda sin ese dinero. Toca una categoría para ver sus movimientos.</p>
       ${items.map(x=>`<div class="grupo" onclick="verCategoria('${x.cid}')">
         <div class="row"><span class="gnom"><span class="gic" style="background:var(--interno-bg)">${icono(x.c)}</span>${esc(x.c?x.c.nombre:'Sin clasificar')}</span><span class="mono int">${x.neto>=0?'+':''}${fmtEUR(x.neto)}</span></div>
         ${barraEntradaSalida(x.sale, x.entra, max)}
@@ -1522,7 +1524,7 @@ function htmlFlujosEvolucion(){
   }).join('');
   return `<h2 class="seccion">Flujos internos · evolución 🔄</h2>
     <div class="card">
-      <p class="micro muted" style="margin-top:0">Rojo = sale de tu bolsillo hacia otra cuenta propia; verde = vuelve. No afecta a tu balance: en este periodo tus ingresos reales fueron ${fmtEUR(ingPeriodo)} y tu gasto real ${fmtEUR(gasPeriodo)}.</p>
+      <p class="micro muted" style="margin-top:0">Rojo = sale de tu bolsillo hacia otra cuenta propia; verde = vuelve. No es gasto ni ingreso real, pero sí está descontado del Balance (esta cuenta se queda sin ese dinero). En este periodo tus ingresos reales fueron ${fmtEUR(ingPeriodo)} y tu gasto real ${fmtEUR(gasPeriodo)}.</p>
       ${bloques}
     </div>`;
 }
@@ -1550,12 +1552,12 @@ function pintarGraficas(){
     data:{labels, datasets:[
       {label:'Ingresos', data:res.map(x=>x.r.ingReal), backgroundColor:cIng, borderRadius:3, order:2},
       {label:'Gastos', data:res.map(x=>x.r.gasReal), backgroundColor:cGas, borderRadius:3, order:2},
-      {label:'Balance', data:res.map(x=>r2(x.r.ingReal-x.r.gasReal)), type:'line', borderColor:cInk, backgroundColor:cInk, borderWidth:2, tension:0.3, pointRadius:2, order:1}
+      {label:'Balance', data:res.map(x=>x.r.balance), type:'line', borderColor:cInk, backgroundColor:cInk, borderWidth:2, tension:0.3, pointRadius:2, order:1}
     ]},
     options:{...baseOpts(), plugins:{...baseOpts().plugins, legend:{display:true, position:'bottom', labels:{boxWidth:10,font:{size:10},color:cMuted}}}}
   });
   // 2) tasa de ahorro
-  const tasa = res.map(x=> x.r.ingReal>0 ? Math.round((x.r.ingReal-x.r.gasReal)/x.r.ingReal*100) : 0);
+  const tasa = res.map(x=> x.r.ingReal>0 ? Math.round(x.r.balance/x.r.ingReal*100) : 0);
   anChart2 = new Chart(document.getElementById('ch-ahorro'), {
     type:'line',
     data:{labels, datasets:[{label:'Ahorro', data:tasa, borderColor:cIng, backgroundColor:'rgba(30,107,79,0.12)', fill:true, tension:0.3, pointRadius:2}]},
@@ -1578,13 +1580,14 @@ function pintarGraficas(){
 
   // mini-resumen del periodo
   const ing = res.reduce((s,x)=>s+x.r.ingReal,0), gas = res.reduce((s,x)=>s+x.r.gasReal,0);
+  const bal = res.reduce((s,x)=>s+x.r.balance,0);
   const mesesN = res.length;
   const ar = document.getElementById('an-resumen');
   if (ar) ar.innerHTML = `<div class="card"><div class="micro muted">Medias del periodo (${mesesN} meses)</div>
     <div class="row" style="margin-top:6px"><span>Ingreso medio/mes</span><span class="mono pos">${fmtEUR(ing/mesesN)}</span></div>
     <div class="row"><span>Gasto medio/mes</span><span class="mono neg">${fmtEUR(gas/mesesN)}</span></div>
-    <div class="row"><span>Ahorro medio/mes</span><span class="mono ${ing-gas>=0?'pos':'neg'}">${fmtEUR((ing-gas)/mesesN)}</span></div>
-    <div class="row"><span>Tasa de ahorro media</span><span class="mono">${ing>0?Math.round((ing-gas)/ing*100):0}%</span></div>
+    <div class="row"><span>Balance medio/mes</span><span class="mono ${bal>=0?'pos':'neg'}">${fmtEUR(bal/mesesN)}</span></div>
+    <div class="row"><span>Tasa de ahorro media</span><span class="mono">${ing>0?Math.round(bal/ing*100):0}%</span></div>
   </div>`;
 }
 
@@ -1602,12 +1605,12 @@ function vPresupuesto(){
   for (const c of gastoCats){ totCalc += (c.planCalc||0); totEfect += planEfectivo(c,modoMes); if(modoMes?tieneOverride(c.id,modoMes):c.planManual!=null) nAjustes++; }
   const dif = totEfect - totCalc;
   const ingEfect = ingCats.reduce((s,c)=>s+planEfectivo(c,modoMes),0);
-  const balancePrev = ingEfect - totEfect;
   // flujo interno previsto (positivo = sale de la cuenta hacia ahorro/otras cuentas propias)
   let totInternoEfect=0, nAjustesInterno=0;
   for (const c of internoCats){ totInternoEfect += planEfectivo(c,modoMes); if(modoMes?tieneOverride(c.id,modoMes):c.planManual!=null) nAjustesInterno++; }
+  // Balance previsto ya descuenta el traspaso: esta cuenta se queda sin ese dinero, vaya donde vaya
+  const balancePrev = r2(ingEfect - totEfect - totInternoEfect);
   const salidaTotal = r2(totEfect + totInternoEfect);      // todo lo que sale de la cuenta: gasto + traspasos
-  const disponible = r2(ingEfect - totEfect - totInternoEfect); // lo que te queda tras gasto Y traspasos
   // referencia histórica (mediana de los últimos 12 meses) de cuánto sale y cuánto vuelve en
   // conjunto en los flujos internos, para poder entender de qué se compone la diferencia
   const refInterno = internoCats.reduce((acc,c)=>{
@@ -1677,7 +1680,7 @@ function vPresupuesto(){
         <span class="micro"><strong>Diferencia prevista${modoMes?` (${nombreMesLargo(modoMes)})`:''}</strong></span>
         <span class="mono" style="font-weight:600;color:var(--interno)">${totInternoEfect>=0?'-':'+'}${fmtEUR(Math.abs(totInternoEfect))}</span>
       </div>
-      <p class="tiny muted" style="margin:8px 0 0">"Sale" y "vuelve" son la mediana de tus últimos 12 meses, para que entiendas de qué se compone. La diferencia es la cifra que realmente se usa en "Lo que te queda" más abajo — ajústala en <strong>Traspasos a tus cuentas</strong> si este ${modoMes?'mes':'periodo'} vas a mover más o menos.${nAjustesInterno?` Ahora mismo tienes ${nAjustesInterno} ajuste${nAjustesInterno>1?'s':''} a mano.`:''}</p>
+      <p class="tiny muted" style="margin:8px 0 0">"Sale" y "vuelve" son la mediana de tus últimos 12 meses, para que entiendas de qué se compone. La diferencia es la cifra que ya está descontada en el <strong>Balance previsto</strong> de arriba — ajústala en <strong>Traspasos a tus cuentas</strong> si este ${modoMes?'mes':'periodo'} vas a mover más o menos.${nAjustesInterno?` Ahora mismo tienes ${nAjustesInterno} ajuste${nAjustesInterno>1?'s':''} a mano.`:''}</p>
     </div>`:''}
 
     <h2 class="seccion" style="margin-top:8px">Ingresos esperados</h2>
@@ -1698,7 +1701,7 @@ function vPresupuesto(){
 
     ${internoCats.length?`<h2 class="seccion">Traspasos a tus cuentas <span class="tiny muted">(no es gasto, pero sale de la cuenta)</span></h2>
     <div class="card" style="padding:12px 14px">
-      <p class="micro muted" style="margin-top:0">Cuánto planeas mover a ahorro u otras cuentas propias. Se calcula igual que el resto (mediana de los últimos 12 meses) y puedes ajustarlo aquí abajo para ver cómo cambia lo que te queda disponible si traspasas más o menos.${nAjustesInterno?` <strong>${nAjustesInterno} ajuste${nAjustesInterno>1?'s':''}${modoMes?' este mes':''}.</strong>`:''}</p>
+      <p class="micro muted" style="margin-top:0">Cuánto planeas mover a ahorro u otras cuentas propias. Se calcula igual que el resto (mediana de los últimos 12 meses) y puedes ajustarlo aquí abajo para ver cómo cambia el Balance previsto si traspasas más o menos.${nAjustesInterno?` <strong>${nAjustesInterno} ajuste${nAjustesInterno>1?'s':''}${modoMes?' este mes':''}.</strong>`:''}</p>
       ${internoCats.map(c=>{
         const h = historicoSalidaEntrada(c.id);
         return filaCat(c) + `<div class="tiny muted" style="margin:-6px 0 10px 2px">sale ${fmtEUR(h.sale)} · entra ${fmtEUR(h.entra)} <span class="micro">(mediana histórica)</span></div>`;
@@ -1708,8 +1711,8 @@ function vPresupuesto(){
         <span class="mono neg">${fmtEUR(salidaTotal)}</span>
       </div>
       <div class="row" style="margin-top:6px">
-        <span class="micro"><strong>Lo que te queda</strong></span>
-        <span class="mono" style="font-weight:600;color:${disponible>=0?'var(--ingreso)':'var(--gasto)'}">${fmtEUR(disponible)}</span>
+        <span class="micro"><strong>Balance previsto</strong> <span class="tiny muted">(el mismo de arriba)</span></span>
+        <span class="mono" style="font-weight:600;color:${balancePrev>=0?'var(--ingreso)':'var(--gasto)'}">${fmtEUR(balancePrev)}</span>
       </div>
     </div>`:''}
 
