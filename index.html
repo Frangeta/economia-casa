@@ -90,7 +90,7 @@ main{padding:0 14px}
 .pill.rev{background:var(--plan-bg);color:var(--plan)}
 
 /* formularios */
-input[type=text],input[type=search],input[type=email],input[type=password],select{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:12px;font-size:14px;background:var(--card);color:var(--ink);font-family:inherit}
+input[type=text],input[type=search],input[type=email],input[type=password],input[type=date],input[type=number],select{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:12px;font-size:14px;background:var(--card);color:var(--ink);font-family:inherit}
 input:focus,select:focus,button:focus-visible{outline:2px solid var(--marca);outline-offset:1px}
 .btn{display:inline-block;background:var(--marca);color:#fff;border:none;border-radius:12px;padding:11px 18px;font-size:14px;font-weight:500;cursor:pointer;font-family:inherit}
 .btn.sec{background:var(--card);color:var(--ink);border:1px solid var(--line)}
@@ -156,6 +156,22 @@ h2.seccion{font-family:'Fraunces',serif;font-weight:600;font-size:16px;margin:18
 input[type=range]{-webkit-appearance:none;appearance:none;height:6px;background:var(--line);border-radius:3px;outline:none}
 input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:var(--marca);cursor:pointer;border:2px solid var(--card);box-shadow:var(--sombra)}
 input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;background:var(--marca);cursor:pointer;border:2px solid var(--card)}
+
+/* saldo en cuenta */
+.saldo-card{background:var(--card);border-radius:16px;padding:15px 16px 12px;margin-bottom:12px;box-shadow:var(--sombra);cursor:pointer}
+.saldo-cifra{font-family:'Fraunces',serif;font-weight:600;font-size:30px;letter-spacing:-0.02em;font-variant-numeric:tabular-nums;line-height:1.1}
+.saldo-cifra.bajo{color:var(--gasto)}
+.spark{display:block;width:100%;height:46px;margin-top:8px}
+.saldo-chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:3px 9px;border-radius:9px;background:var(--bg);color:var(--muted)}
+.saldo-chip.ok{background:var(--ingreso-bg);color:var(--ingreso)}
+.saldo-chip.warn{background:var(--plan-bg);color:var(--plan)}
+.saldo-chip.bad{background:var(--gasto-bg);color:var(--gasto)}
+.dia-row{display:flex;gap:10px;align-items:baseline;padding:9px 4px;border-bottom:1px solid var(--line);cursor:pointer}
+.dia-row:last-child{border-bottom:none}
+.dia-row .dfecha{width:60px;flex-shrink:0;font-size:12px;color:var(--muted)}
+.dia-row .dneto{flex:1;font-variant-numeric:tabular-nums;font-size:13px}
+.dia-row .dsaldo{font-variant-numeric:tabular-nums;font-size:14px;font-weight:500}
+.dia-movs{padding:2px 0 8px 14px;border-bottom:1px solid var(--line)}
 
 /* avisos unificados */
 .avisos{background:var(--card);border-radius:14px;margin-bottom:12px;box-shadow:var(--sombra);overflow:hidden}
@@ -812,12 +828,148 @@ function descCorta(m){
   return conLetras || p[0] || '(sin descripción)';
 }
 
+/* ============ SALDO EN CUENTA ============
+   El extracto solo dice cuánto se mueve, no cuánto hay. Con un único punto de anclaje
+   (saldo real de un día concreto) se puede reconstruir el saldo de cualquier otro día:
+   hacia delante sumando los movimientos posteriores y hacia atrás restándolos.
+   Se guarda en META.saldo (viaja en la config compartida de Firestore y en la copia de
+   seguridad): {fecha, importe, momento:'cierre'|'inicio', colchon, actualizado}.
+   Convención interna: todo se calcula sobre el SALDO AL CIERRE del día (ya incluidos los
+   movimientos de esa fecha). Si el usuario apuntó el saldo antes de los movimientos del día,
+   momento='inicio' y se normaliza al cierre sumando el neto de ese día. */
+const hoyISO = () => { const d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); };
+const sumaDias = (f,n) => { const d=new Date(f+'T00:00:00'); d.setDate(d.getDate()+n); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); };
+const saldoConfigurado = () => (META && META.saldo && META.saldo.fecha && META.saldo.importe!=null) ? META.saldo : null;
+
+/* Movimientos agregados por día, en orden, con el acumulado corrido desde el principio.
+   Se cachea porque se consulta muchas veces por render; basta con invalidar cuando cambia
+   el número de movimientos (los importes de un movimiento ya existente no se editan). */
+let _diasCache=null, _diasCacheKey='';
+function diasConMovs(){
+  const key = MOVS.length+'';
+  if (_diasCache && _diasCacheKey===key) return _diasCache;
+  const porDia = new Map();
+  for (const m of MOVS){
+    let d = porDia.get(m.fecha);
+    if (!d){ d={fecha:m.fecha, entra:0, sale:0, neto:0, movs:[]}; porDia.set(m.fecha,d); }
+    if (m.importe>=0) d.entra += m.importe; else d.sale += -m.importe;
+    d.neto += m.importe; d.movs.push(m);
+  }
+  const arr = [...porDia.values()].sort((a,b)=>a.fecha.localeCompare(b.fecha));
+  let acc=0;
+  for (const d of arr){ d.entra=r2(d.entra); d.sale=r2(d.sale); d.neto=r2(d.neto); acc=r2(acc+d.neto); d.acum=acc; }
+  _diasCache=arr; _diasCacheKey=key;
+  return arr;
+}
+const diaPorFecha = f => diasConMovs().find(d=>d.fecha===f) || null;
+/* acumulado de netos de todos los días <= fecha (búsqueda binaria sobre el array ordenado) */
+function acumHasta(fecha){
+  const arr = diasConMovs();
+  let lo=0, hi=arr.length-1, res=0;
+  while (lo<=hi){ const mid=(lo+hi)>>1; if (arr[mid].fecha<=fecha){ res=arr[mid].acum; lo=mid+1; } else hi=mid-1; }
+  return res;
+}
+/* ancla normalizada a saldo al cierre del día */
+function anclaCierre(){
+  const s = saldoConfigurado(); if (!s) return null;
+  let cierre = s.importe;
+  if (s.momento==='inicio'){ const d=diaPorFecha(s.fecha); cierre = r2(cierre + (d?d.neto:0)); }
+  return {fecha:s.fecha, cierre:r2(cierre)};
+}
+/* saldo al cierre de cualquier día */
+function saldoEn(fecha){
+  const a = anclaCierre(); if (!a) return null;
+  return r2(a.cierre + acumHasta(fecha) - acumHasta(a.fecha));
+}
+const fechaUltimoMov = () => { const a=diasConMovs(); return a.length ? a[a.length-1].fecha : null; };
+/* último día del que sabemos el saldo con datos reales: el más reciente entre el ancla y el
+   último movimiento importado (más allá de ahí solo hay previsión) */
+function fechaUltimoDato(){
+  const s = saldoConfigurado();
+  const arr = diasConMovs();
+  const ult = arr.length ? arr[arr.length-1].fecha : null;
+  const c = [s&&s.fecha, ult].filter(Boolean).sort();
+  return c.length ? c[c.length-1] : null;
+}
+/* serie diaria continua (incluye días sin movimientos, con saldo plano) */
+function serieSaldoDiaria(dias, hasta){
+  const fin = hasta || fechaUltimoDato(); if (!fin || !saldoConfigurado()) return [];
+  const a = anclaCierre();
+  const primero = diasConMovs()[0];
+  const minFecha = [a.fecha, primero?primero.fecha:a.fecha].sort()[0];
+  let ini = sumaDias(fin, -(dias-1));
+  if (ini < minFecha) ini = minFecha;
+  const out=[];
+  for (let f=ini; f<=fin; f=sumaDias(f,1)){
+    out.push({fecha:f, saldo:saldoEn(f), dia:diaPorFecha(f)});
+  }
+  return out;
+}
+
+/* Saldo que reporta el banco al cierre de un día concreto. Cada movimiento trae su saldo
+   posterior, pero no sabemos en qué orden ocurrieron dentro del día: el saldo de cierre es
+   el único que no es "el saldo previo" de ningún otro movimiento del mismo día. Si la cadena
+   no se puede resolver sin ambigüedad se devuelve null (mejor no cuadrar que cuadrar mal). */
+function saldoBancoDia(fecha){
+  const d = diaPorFecha(fecha); if (!d) return null;
+  const ms = d.movs.filter(m=>m.saldo!=null);
+  if (!ms.length) return null;
+  const eq=(a,b)=>Math.abs(a-b)<0.005;
+  const saldos = ms.map(m=>m.saldo);
+  const previos = ms.map(m=>r2(m.saldo-m.importe));
+  const fin = saldos.filter(s=>!previos.some(p=>eq(p,s)));
+  if (fin.length===1) return r2(fin[0]);
+  const ini = previos.filter(p=>!saldos.some(s=>eq(s,p)));
+  if (ini.length===1) return r2(ini[0] + ms.reduce((a,m)=>a+m.importe,0));
+  return null;
+}
+/* comprobación de cuadre contra el banco en el día fiable más reciente */
+function cuadreBanco(){
+  const arr = diasConMovs();
+  if (!arr.length || !saldoConfigurado()) return null;
+  for (let i=arr.length-1; i>=0 && i>=arr.length-60; i--){
+    const banco = saldoBancoDia(arr[i].fecha);
+    if (banco!=null){
+      const calc = saldoEn(arr[i].fecha);
+      return {fecha:arr[i].fecha, banco, calc, dif:r2(calc-banco)};
+    }
+  }
+  return null;
+}
+/* propuesta de ancla a partir del propio extracto (día fiable más reciente) */
+function anclaSugerida(){
+  const arr = diasConMovs();
+  for (let i=arr.length-1; i>=0 && i>=arr.length-60; i--){
+    const banco = saldoBancoDia(arr[i].fecha);
+    if (banco!=null) return {fecha:arr[i].fecha, importe:banco};
+  }
+  return null;
+}
+
+/* Proyección a fin de mes: al saldo conocido se le suma lo que el presupuesto dice que
+   todavía queda por entrar y se le resta lo que queda por gastar y por traspasar. */
+function proyeccionFinMes(){
+  const f = fechaUltimoDato(); if (!f || !saldoConfigurado()) return null;
+  const hoy = hoyISO();
+  const ref = f>hoy ? f : hoy;
+  const ym = ref.slice(0,7);
+  const R = resumenMes(ym);
+  const gastoPrev = CATS.filter(c=>c.tipo==='gasto').reduce((s,c)=>s+planEfectivo(c,ym),0);
+  const ingPrev   = CATS.filter(c=>c.tipo==='ingreso').reduce((s,c)=>s+planEfectivo(c,ym),0);
+  const intPrev   = CATS.filter(c=>c.tipo==='interno').reduce((s,c)=>s+planEfectivo(c,ym),0);
+  const pendG   = Math.max(r2(gastoPrev - R.gasReal), 0);
+  const pendI   = Math.max(r2(ingPrev   - R.ingReal), 0);
+  const pendInt = Math.max(r2(intPrev   - (R.intOut - R.intIn)), 0);
+  const base = saldoEn(f);
+  return {ym, desde:f, base, pendI, pendG, pendInt, fin:r2(base + pendI - pendG - pendInt)};
+}
+
 /* ============ VISTAS ============ */
 const $ = s => document.querySelector(s);
 function render(){
   try{
     renderNav();
-    ({resumen:vResumen, movimientos:vMovs, analisis:vAnalisis, simulador:vSimulador, presupuesto:vPresupuesto, bandeja:vBandeja, importar:vImportar, ajustes:vAjustes})[vista]();
+    ({resumen:vResumen, saldo:vSaldo, movimientos:vMovs, analisis:vAnalisis, simulador:vSimulador, presupuesto:vPresupuesto, bandeja:vBandeja, importar:vImportar, ajustes:vAjustes})[vista]();
   }catch(err){
     $('#main').innerHTML = `<div class="card"><strong>Algo ha fallado al pintar esta vista.</strong>
       <div class="micro muted" style="margin-top:6px">Haz una captura de este mensaje para poder arreglarlo:</div>
@@ -844,11 +996,12 @@ const ICONS = {
   bandeja:'<svg viewBox="0 0 24 24"><path d="M4 13l3 5h10l3-5M4 13V6h16v7M4 13h5l1.5 2h3L15 13h5"/></svg>',
   importar:'<svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 19h16"/></svg>',
   ajustes:'<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2"/></svg>',
+  saldo:'<svg viewBox="0 0 24 24"><path d="M3 7h15a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7zm0 0a2 2 0 012-2h11"/><circle cx="16.5" cy="13" r="1.3"/></svg>',
   mas:'<svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>'
 };
-const NAV_LABEL = {resumen:'Resumen', movimientos:'Movim.', analisis:'Análisis', presupuesto:'Presup.', bandeja:'Bandeja', importar:'Importar', ajustes:'Ajustes', mas:'Más'};
+const NAV_LABEL = {resumen:'Resumen', saldo:'Saldo', movimientos:'Movim.', analisis:'Análisis', presupuesto:'Presup.', bandeja:'Bandeja', importar:'Importar', ajustes:'Ajustes', mas:'Más'};
 const NAV_PRINCIPAL = ['resumen','movimientos','analisis','presupuesto','mas'];
-const NAV_MAS = ['bandeja','importar','ajustes'];
+const NAV_MAS = ['saldo','bandeja','importar','ajustes'];
 function renderNav(){
   const nb = bandeja().length;
   // "Más" muestra punto si hay algo pendiente en bandeja
@@ -902,6 +1055,7 @@ function vResumen(){
   for (const c of CATS){ if (c.tipo==='gasto'){ const p=planEfectivo(c,mesSel); if(p) planPorGrupo[c.grupo]=(planPorGrupo[c.grupo]||0)+p; } }
 
   $('#main').innerHTML = `
+    ${htmlSaldoCard()}
     <div class="mespicker">
       <button onclick="cambiaMes(-1)" ${idx===0?'disabled':''} aria-label="Mes anterior">‹</button>
       <span class="mes">${fmtYM(mesSel)}</span>
@@ -1188,6 +1342,250 @@ function filtraCat(m){
   if (filtroCat==='__null') return m.categoriaId===null && m.importe<0;
   if (filtroCat==='__ingsc') return m.categoriaId===null && m.importe>0;
   return m.categoriaId===filtroCat;
+}
+
+/* ============ VISTA: DINERO EN CUENTA ============ */
+let saldoDias = 90;          // ventana de la gráfica
+let saldoDiaAbierto = null;  // día desplegado en el detalle
+
+function clasesSaldo(v, colchon){
+  if (v<0) return 'bad';
+  if (colchon!=null && v<colchon) return 'warn';
+  return 'ok';
+}
+/* mini gráfica sin dependencias: solo la silueta del saldo de los últimos días */
+function sparkSaldo(serie){
+  if (serie.length<2) return '';
+  const vals = serie.map(p=>p.saldo);
+  const max = Math.max(...vals), min = Math.min(...vals, 0);
+  const rango = (max-min)||1;
+  const W=300, H=46;
+  const x = i => (i/(serie.length-1))*W;
+  const y = v => H - ((v-min)/rango)*(H-4) - 2;
+  const pts = serie.map((p,i)=>`${x(i).toFixed(1)},${y(p.saldo).toFixed(1)}`).join(' ');
+  const area = `0,${H} ${pts} ${W},${H}`;
+  const cero = min<0 && max>0 ? `<line x1="0" y1="${y(0).toFixed(1)}" x2="${W}" y2="${y(0).toFixed(1)}" stroke="var(--line)" stroke-width="1" stroke-dasharray="3 3"/>` : '';
+  const col = vals[vals.length-1]<0 ? 'var(--gasto)' : 'var(--marca)';
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
+    ${cero}
+    <polygon points="${area}" fill="${col}" opacity="0.08"/>
+    <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
+  </svg>`;
+}
+/* tarjeta de cabecera del Resumen: cuánto dinero hay ahora mismo */
+function htmlSaldoCard(){
+  const s = saldoConfigurado();
+  if (!s){
+    const sug = anclaSugerida();
+    return `<div class="card" style="padding:14px 16px">
+      <div class="row"><span class="gnom" style="gap:9px"><span class="gic" style="background:var(--marca-bg)">💰</span><strong>Dinero en cuenta</strong></span></div>
+      <div class="tiny muted" style="margin-top:8px">El extracto dice cuánto se mueve, no cuánto hay. Dime el saldo real de un día y calculo el de cada día a partir de ahí.</div>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+        ${sug?`<button class="btn" onclick="usarAnclaSugerida()">Usar el del extracto (${fmtEUR2(sug.importe)} a ${fmtDia(sug.fecha)})</button>`:''}
+        <button class="btn ${sug?'sec':''}" onclick="hojaSaldo()">Configurar saldo</button>
+      </div>
+    </div>`;
+  }
+  const f = fechaUltimoDato();
+  const saldo = saldoEn(f);
+  const serie = serieSaldoDiaria(30);
+  const hace30 = serie.length?serie[0].saldo:saldo;
+  const dif = r2(saldo-hace30);
+  const proy = proyeccionFinMes();
+  const cu = cuadreBanco();
+  const desc = cu && Math.abs(cu.dif)>=0.01;
+  return `<div class="saldo-card" onclick="irA('saldo')">
+    <div class="row">
+      <span class="micro muted">Dinero en cuenta · ${f===hoyISO()?'hoy':fmtDia(f)}</span>
+      <span class="micro" style="color:var(--marca)">ver detalle ›</span>
+    </div>
+    <div class="saldo-cifra ${saldo<0?'bajo':''}" style="margin-top:4px">${fmtEUR2(saldo)}</div>
+    <div class="tiny muted" style="margin-top:2px">${dif>=0?'▲':'▼'} ${fmtEUR(Math.abs(dif))} en 30 días${(()=>{const u=fechaUltimoMov(); return u&&u!==hoyISO()?` · último movimiento ${fmtDia(u)}`:'';})()}</div>
+    ${sparkSaldo(serie)}
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
+      ${proy?`<span class="saldo-chip ${clasesSaldo(proy.fin, s.colchon)}">Fin de ${MESES[+proy.ym.split('-')[1]-1]}: ${fmtEUR(proy.fin)}</span>`:''}
+      ${desc?`<span class="saldo-chip bad">No cuadra con el banco (${fmtEUR2(cu.dif)})</span>`:''}
+    </div>
+  </div>`;
+}
+
+function vSaldo(){
+  const s = saldoConfigurado();
+  if (!s){
+    const sug = anclaSugerida();
+    $('#main').innerHTML = `<h2 class="seccion">Dinero en cuenta</h2>
+      <div class="card">
+        <p class="micro muted" style="margin-top:0">Un extracto bancario cuenta los movimientos, no el saldo. Basta con anclar el saldo real de un día cualquiera: a partir de ahí sumo los movimientos posteriores y resto los anteriores para saber cuánto había (y cuánto hay) cada día.</p>
+        ${sug?`<div class="regla-box" style="flex-direction:column;align-items:stretch;gap:8px">
+          <div class="micro">En el extracto ya viene el saldo del banco a <strong>${fmtDia(sug.fecha)}</strong>: <span class="mono">${fmtEUR2(sug.importe)}</span></div>
+          <button class="btn" onclick="usarAnclaSugerida()">Usar ese saldo como ancla</button>
+        </div>`:''}
+        <button class="btn ${sug?'sec':''}" style="margin-top:10px" onclick="hojaSaldo()">Introducir el saldo a mano</button>
+      </div>`;
+    return;
+  }
+  const f = fechaUltimoDato();
+  const saldo = saldoEn(f);
+  const serie = serieSaldoDiaria(saldoDias);
+  const vals = serie.map(p=>p.saldo);
+  const minV = vals.length?Math.min(...vals):saldo, maxV = vals.length?Math.max(...vals):saldo;
+  const diaMin = serie.find(p=>p.saldo===minV);
+  const proy = proyeccionFinMes();
+  const cu = cuadreBanco();
+  const desc = cu && Math.abs(cu.dif)>=0.01;
+  const diasLista = serie.filter(p=>p.dia).slice(-60).reverse();
+  const ultMov = fechaUltimoMov();
+  const atraso = ultMov ? Math.round((new Date(hoyISO()) - new Date(ultMov))/86400000) : 0;
+
+  $('#main').innerHTML = `
+    <h2 class="seccion">Dinero en cuenta</h2>
+    <div class="card">
+      <div class="micro muted">Saldo ${f===hoyISO()?'a día de hoy':'al cierre del '+fmtDia(f)}</div>
+      <div class="saldo-cifra ${saldo<0?'bajo':''}" style="margin-top:3px">${fmtEUR2(saldo)}</div>
+      <div class="tiny muted" style="margin-top:4px">
+        Anclado a <strong>${fmtDia(s.fecha)} ${s.fecha.slice(0,4)}</strong> con ${fmtEUR2(s.importe)} (${s.momento==='inicio'?'antes':'después'} de los movimientos de ese día)
+      </div>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+        <button class="btn sec" onclick="hojaSaldo()">Cambiar ancla</button>
+        ${ultMov&&ultMov!==hoyISO()?`<span class="saldo-chip ${atraso>7?'warn':''}" style="align-self:center">Último movimiento: ${fmtDia(ultMov)}${atraso>7?' · importa el extracto para ponerlo al día':''}</span>`:''}
+      </div>
+    </div>
+    ${desc?`<div class="card" style="border-left:3px solid var(--gasto)">
+      <div class="row"><strong style="font-size:14px">No cuadra con el banco</strong><span class="mono neg">${fmtEUR2(cu.dif)}</span></div>
+      <div class="tiny muted" style="margin-top:6px">A ${fmtDia(cu.fecha)} el extracto dice <span class="mono">${fmtEUR2(cu.banco)}</span> y yo calculo <span class="mono">${fmtEUR2(cu.calc)}</span>. O falta algún movimiento por importar, o el saldo del ancla no era el de ese día.</div>
+      <button class="btn" style="margin-top:10px" onclick="usarAnclaSugerida()">Re-anclar al saldo del banco</button>
+    </div>`:cu?`<div class="card" style="padding:12px 14px"><div class="row"><span class="micro muted">Cuadra con el saldo del banco a ${fmtDia(cu.fecha)}</span><span class="saldo-chip ok">✓ ${fmtEUR2(cu.banco)}</span></div></div>`:''}
+    ${proy?`<div class="card">
+      <div class="micro muted">Previsión a fin de ${MESES[+proy.ym.split('-')[1]-1]}</div>
+      <div class="saldo-cifra ${proy.fin<0?'bajo':''}" style="font-size:24px;margin-top:3px">${fmtEUR2(proy.fin)}</div>
+      <div class="row" style="margin-top:10px"><span class="tiny muted">Saldo hoy</span><span class="mono tiny">${fmtEUR2(proy.base)}</span></div>
+      ${proy.pendI?`<div class="row"><span class="tiny muted">Ingresos que faltan por entrar</span><span class="mono tiny pos">+${fmtEUR(proy.pendI)}</span></div>`:''}
+      ${proy.pendG?`<div class="row"><span class="tiny muted">Gasto que falta por hacer</span><span class="mono tiny neg">−${fmtEUR(proy.pendG)}</span></div>`:''}
+      ${proy.pendInt?`<div class="row"><span class="tiny muted">Traspasos pendientes a otras cuentas</span><span class="mono tiny int">−${fmtEUR(proy.pendInt)}</span></div>`:''}
+      <div class="tiny muted" style="margin-top:8px">Estimación con tu presupuesto del mes, no una certeza: si el gasto va más rápido de lo previsto, la cifra real será menor.</div>
+      ${s.colchon!=null&&proy.fin<s.colchon?`<div class="tiny" style="margin-top:8px;color:var(--gasto)">Por debajo de tu colchón de ${fmtEUR(s.colchon)}.</div>`:''}
+    </div>`:''}
+    <div class="filtros">
+      <select onchange="saldoDias=+this.value;render()">
+        <option value="30" ${saldoDias===30?'selected':''}>Últimos 30 días</option>
+        <option value="90" ${saldoDias===90?'selected':''}>Últimos 3 meses</option>
+        <option value="180" ${saldoDias===180?'selected':''}>Últimos 6 meses</option>
+        <option value="365" ${saldoDias===365?'selected':''}>Último año</option>
+        <option value="3650" ${saldoDias>365?'selected':''}>Todo el histórico</option>
+      </select>
+    </div>
+    <div class="card"><div class="micro muted" style="margin-bottom:6px">Saldo día a día</div>
+      <div style="height:210px"><canvas id="ch-saldo"></canvas></div>
+      <div class="row" style="margin-top:10px"><span class="tiny muted">Mínimo del periodo${diaMin?` (${fmtDia(diaMin.fecha)})`:''}</span><span class="mono tiny ${minV<0?'neg':''}">${fmtEUR2(minV)}</span></div>
+      <div class="row"><span class="tiny muted">Máximo del periodo</span><span class="mono tiny">${fmtEUR2(maxV)}</span></div>
+    </div>
+    <h2 class="seccion">Días con movimiento</h2>
+    <div class="card">
+      ${diasLista.length?diasLista.map(p=>`
+        <div class="dia-row" onclick="toggleDiaSaldo('${p.fecha}')">
+          <span class="dfecha">${fmtDia(p.fecha)}</span>
+          <span class="dneto">${p.dia.entra?`<span class="pos">+${fmtEUR(p.dia.entra)}</span>`:''}${p.dia.entra&&p.dia.sale?' · ':''}${p.dia.sale?`<span class="neg">−${fmtEUR(p.dia.sale)}</span>`:''}</span>
+          <span class="dsaldo ${p.saldo<0?'neg':''}">${fmtEUR2(p.saldo)}</span>
+        </div>
+        ${saldoDiaAbierto===p.fecha?`<div class="dia-movs">${htmlListaMovs([...p.dia.movs].sort((a,b)=>Math.abs(b.importe)-Math.abs(a.importe)))}</div>`:''}
+      `).join(''):'<div class="vacio">Sin movimientos en este periodo.</div>'}
+    </div>`;
+  setTimeout(pintarSaldo, 30);
+}
+function toggleDiaSaldo(f){ saldoDiaAbierto = saldoDiaAbierto===f?null:f; render(); }
+
+let saldoChart=null;
+function pintarSaldo(){
+  const el = document.getElementById('ch-saldo');
+  if (!el || typeof Chart==='undefined') return;
+  const serie = serieSaldoDiaria(saldoDias);
+  const css = getComputedStyle(document.documentElement);
+  const cMarca = css.getPropertyValue('--marca').trim(), cMuted = css.getPropertyValue('--muted').trim();
+  const cGasto = css.getPropertyValue('--gasto').trim();
+  const s = saldoConfigurado();
+  // con muchos días no se etiquetan todos: se deja que Chart.js decida el salto
+  const labels = serie.map(p=>fmtDia(p.fecha));
+  const datasets = [{
+    label:'Saldo', data:serie.map(p=>p.saldo), borderColor:cMarca,
+    backgroundColor:'rgba(91,110,232,0.10)', fill:true, tension:0.15, pointRadius:0,
+    borderWidth:2, pointHitRadius:12
+  }];
+  if (s && s.colchon!=null) datasets.push({
+    label:'Colchón', data:serie.map(()=>s.colchon), borderColor:cGasto, borderDash:[5,4],
+    borderWidth:1.5, pointRadius:0, fill:false
+  });
+  if (saldoChart) saldoChart.destroy();
+  saldoChart = new Chart(el, {
+    type:'line',
+    data:{labels, datasets},
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      interaction:{mode:'index', intersect:false},
+      plugins:{legend:{display:false}, tooltip:{callbacks:{
+        title:it=>{ const p=serie[it[0].dataIndex]; return fmtDia(p.fecha)+' '+p.fecha.slice(0,4); },
+        label:c=>c.dataset.label+': '+fmtEUR2(c.parsed.y),
+        afterBody:it=>{ const p=serie[it[0].dataIndex]; if(!p.dia) return ''; 
+          const l=[]; if(p.dia.entra) l.push('Entra '+fmtEUR2(p.dia.entra)); if(p.dia.sale) l.push('Sale '+fmtEUR2(p.dia.sale)); return l.join(' · '); }
+      }}},
+      scales:{
+        x:{grid:{display:false}, ticks:{color:cMuted, font:{size:10}, maxRotation:0, autoSkip:true, maxTicksLimit:6}},
+        y:{grid:{color:'rgba(0,0,0,0.06)'}, ticks:{color:cMuted, font:{size:10}, callback:v=>Math.abs(v)>=1000?(v/1000)+'k':v}}
+      }
+    }
+  });
+}
+
+/* ---- Configurar el ancla de saldo ---- */
+function hojaSaldo(){
+  const s = saldoConfigurado() || {};
+  const sug = anclaSugerida();
+  $('#velo').style.display='block';
+  const h = $('#hoja'); h.style.display='block';
+  h.innerHTML = `
+    <h3>Saldo en cuenta</h3>
+    <div class="micro muted">Dime cuánto había realmente en la cuenta un día concreto. Con eso calculo el saldo de todos los demás días a partir de los movimientos.</div>
+    <div class="campo"><label for="sa-fecha">Fecha</label>
+      <input type="date" id="sa-fecha" value="${esc(s.fecha||sug?.fecha||hoyISO())}" max="${hoyISO()}"></div>
+    <div class="campo"><label for="sa-importe">Saldo ese día (€)</label>
+      <input type="number" step="0.01" inputmode="decimal" id="sa-importe" value="${s.importe!=null?s.importe:(sug?sug.importe:'')}" placeholder="1234,56"></div>
+    <div class="campo"><label for="sa-momento">¿En qué momento del día?</label>
+      <select id="sa-momento">
+        <option value="cierre" ${s.momento!=='inicio'?'selected':''}>Al final del día (ya incluye sus movimientos)</option>
+        <option value="inicio" ${s.momento==='inicio'?'selected':''}>Al empezar el día (antes de sus movimientos)</option>
+      </select></div>
+    <div class="campo"><label for="sa-colchon">Colchón mínimo (opcional)</label>
+      <input type="number" step="1" inputmode="decimal" id="sa-colchon" value="${s.colchon!=null?s.colchon:''}" placeholder="p. ej. 1500">
+      <div class="tiny muted" style="margin-top:4px">Aviso cuando el saldo, o la previsión de fin de mes, baje de aquí.</div></div>
+    ${sug?`<div class="regla-box"><span class="micro">El extracto trae el saldo del banco a ${fmtDia(sug.fecha)}: <span class="mono">${fmtEUR2(sug.importe)}</span></span><button class="btn sec" onclick="usarAnclaSugerida()">Usar</button></div>`:''}
+    <div class="campo" style="display:flex;gap:8px">
+      <button class="btn" onclick="guardarSaldo()">Guardar</button>
+      <button class="btn sec" onclick="cerrarHoja()">Cancelar</button>
+      ${saldoConfigurado()?`<button class="btn sec" onclick="quitarSaldo()" style="margin-left:auto;color:var(--gasto)">Quitar</button>`:''}
+    </div>`;
+}
+async function guardarSaldo(){
+  const fecha = document.getElementById('sa-fecha').value;
+  const importe = parseFloat(String(document.getElementById('sa-importe').value).replace(',','.'));
+  const momento = document.getElementById('sa-momento').value;
+  const colchonRaw = String(document.getElementById('sa-colchon').value).replace(',','.').trim();
+  if (!fecha || isNaN(importe)){ alert('Necesito una fecha y un importe para anclar el saldo.'); return; }
+  META.saldo = {fecha, importe:r2(importe), momento, colchon: colchonRaw===''?null:r2(parseFloat(colchonRaw)), actualizado:new Date().toISOString()};
+  await guardarConfig();
+  cerrarHoja(); render();
+}
+async function usarAnclaSugerida(){
+  const sug = anclaSugerida();
+  if (!sug){ alert('El extracto importado no trae el saldo del banco, así que hay que introducirlo a mano.'); return; }
+  const prev = saldoConfigurado() || {};
+  META.saldo = {fecha:sug.fecha, importe:sug.importe, momento:'cierre', colchon: prev.colchon!=null?prev.colchon:null, actualizado:new Date().toISOString()};
+  await guardarConfig();
+  cerrarHoja(); render();
+}
+async function quitarSaldo(){
+  if (!confirm('¿Quitar el saldo anclado? Dejarás de ver el dinero en cuenta.')) return;
+  META.saldo = null;
+  await guardarConfig();
+  cerrarHoja(); render();
 }
 
 function vMovs(){
